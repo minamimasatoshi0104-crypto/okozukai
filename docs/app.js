@@ -1,7 +1,7 @@
 'use strict';
 
 const CFG = window.OKOZUKAI_CONFIG;
-const TOKEN_KEY = 'okozukai.idToken';
+const SESSION_KEY = 'okozukai.session';
 const CAT_COLORS = { '食べ物': '#0E7C66', '遊び': '#F0A04B', '課金': '#4F4FC9', '買い物': '#7A8F2E', '交通': '#A9D3C7', '貯金': '#6B7FA8', '使途不明': '#C2410C', 'その他': '#9AA5A0' };
 const MARKS = [
   { label: '未チェック', cls: '' },
@@ -11,7 +11,7 @@ const MARKS = [
 ];
 
 const S = {
-  idToken: null,
+  session: null,
   user: null,
   month: thisMonth(),
   data: null,
@@ -96,36 +96,45 @@ function markPill(m) {
 
 // ---------- 認証（Google ログイン） ----------
 
-function tokenExp(t) {
-  try {
-    return JSON.parse(atob(t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))).exp || 0;
-  } catch (e) {
-    return 0;
-  }
+// Google の ID トークンはログイン時に一度だけサーバーへ渡し、以後はサーバーが発行したセッションを使う
+
+function setSession(s) {
+  S.session = s;
+  storage((ls) => (s ? ls.setItem(SESSION_KEY, s) : ls.removeItem(SESSION_KEY)));
 }
 
-function setToken(t) {
-  S.idToken = t;
-  storage((ls) => (t ? ls.setItem(TOKEN_KEY, t) : ls.removeItem(TOKEN_KEY)));
-}
-
+let googleReady = false;
+let googleWait = 0;
 function initGoogle() {
   if (!window.google || !google.accounts) {
+    // 読み込めないまま真っ白にならないよう、10秒で案内を出す
+    if (++googleWait === 50 && !S.session) renderLogin('ログインの準備ができませんでした。通信状態を確かめて、アプリを開き直してください。');
     setTimeout(initGoogle, 200);
     return;
   }
   google.accounts.id.initialize({
     client_id: CFG.clientId,
     auto_select: true,
-    callback: (res) => {
-      setToken(res.credential);
-      start();
-    },
+    callback: onGoogleLogin,
   });
-  if (!S.idToken) {
+  googleReady = true;
+  if (!S.session) {
     renderLogin();
     google.accounts.id.prompt();
   }
+}
+
+async function onGoogleLogin(res) {
+  renderMessage('ログインしています…');
+  try {
+    const data = await api('login', { idToken: res.credential });
+    setSession(data.session);
+    S.user = data.user;
+  } catch (e) {
+    if (!S.user) renderLogin(e.message === 'forbidden' ? 'このアカウントは登録されていません。' : 'ログインできませんでした。もう一度試してください。');
+    return;
+  }
+  await load(thisMonth());
 }
 
 function renderLogin(message) {
@@ -135,17 +144,24 @@ function renderLogin(message) {
     '<div id="gbtn"></div>' +
     (message ? '<p class="small" style="color:var(--warn)">' + h(message) + '</p>' : '') +
     '</div>';
-  if (window.google && google.accounts) {
+  if (googleReady) {
     google.accounts.id.renderButton(document.getElementById('gbtn'), { theme: 'outline', size: 'large', shape: 'pill', text: 'signin_with', locale: 'ja' });
   }
 }
 
+function renderMessage(message, retry) {
+  app.innerHTML =
+    '<div class="login"><h1>おこづかい帳</h1><p class="muted">' + h(message) + '</p>' +
+    (retry ? '<button class="btn" data-act="retry">もう一度読み込む</button>' : '') +
+    '</div>';
+}
+
 function signOut(message) {
-  setToken(null);
+  setSession(null);
   S.user = null;
   S.data = null;
   renderLogin(message);
-  if (window.google && google.accounts) google.accounts.id.prompt();
+  if (googleReady) google.accounts.id.prompt();
 }
 
 // ---------- API ----------
@@ -154,12 +170,14 @@ async function api(action, params) {
   const res = await fetch(CFG.apiUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-    body: JSON.stringify({ action: action, params: params || {}, idToken: S.idToken }),
+    body: JSON.stringify({ action: action, params: params || {}, session: S.session }),
   });
   const json = await res.json();
-  if (!json.ok) {
+  if (!json.ok && action !== 'login') {
     if (json.error === 'unauthenticated') signOut('ログインの有効期限が切れました。もう一度ログインしてください。');
     if (json.error === 'forbidden' && action === 'me') signOut('このアカウントは登録されていません。');
+  }
+  if (!json.ok) {
     throw new Error(json.error);
   }
   return json.data;
@@ -191,9 +209,12 @@ async function load(month) {
 }
 
 async function start() {
+  renderMessage('読み込み中…');
   try {
     S.user = await api('me');
   } catch (e) {
+    // ログイン切れなどは api() がログイン画面に切り替える。それ以外は通信の失敗として案内する
+    if (S.session) renderMessage('通信に失敗しました。電波の良いところで試してください。', true);
     return;
   }
   await load(thisMonth());
@@ -485,6 +506,7 @@ app.addEventListener('click', async (e) => {
   const el = e.target.closest('[data-act]');
   if (!el) return;
   const act = el.dataset.act;
+  if (act === 'retry') return start();
   if (act === 'month') return load(el.dataset.m);
   if (act === 'type') {
     S.inputType = el.dataset.v;
@@ -597,10 +619,13 @@ if ('serviceWorker' in navigator) {
 }
 
 (function boot() {
-  const saved = storage((ls) => ls.getItem(TOKEN_KEY));
-  if (saved && tokenExp(saved) > Date.now() / 1000 + 60) {
-    S.idToken = saved;
+  storage((ls) => ls.removeItem('okozukai.idToken')); // 以前の版の保存値
+  const saved = storage((ls) => ls.getItem(SESSION_KEY));
+  if (saved) {
+    S.session = saved;
     start();
+  } else {
+    renderMessage('読み込み中…');
   }
   initGoogle();
 })();

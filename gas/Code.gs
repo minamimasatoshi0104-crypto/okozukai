@@ -51,7 +51,8 @@ function doPost(e) {
     return json_({ ok: false, error: 'bad_request' });
   }
   try {
-    const user = authenticate_(body.idToken);
+    if (body.action === 'login') return json_({ ok: true, data: login_((body.params || {}).idToken) });
+    const user = authenticate_(body.session);
     const handler = ACTIONS[body.action];
     if (!handler) return json_({ ok: false, error: 'unknown_action' });
     if (handler.role && handler.role !== user.role) return json_({ ok: false, error: 'forbidden' });
@@ -73,31 +74,52 @@ function doGet() {
 
 // ---- 認証 ----
 
-function authenticate_(idToken) {
-  if (!idToken) throw new Error('unauthenticated');
-  const cache = CacheService.getScriptCache();
-  const key = 'tok_' + Utilities.base64EncodeWebSafe(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, idToken));
-  const hit = cache.get(key);
-  if (hit) return JSON.parse(hit);
+// Google の ID トークンは1時間で切れるため、ログイン時に一度だけ確認して長期のセッションを発行する。
+// セッションはスプレッドシートのドキュメントプロパティに、ハッシュ値をキーにして保存する。
+const SESSION_DAYS = 180;
 
+function login_(idToken) {
+  if (!idToken) throw new Error('unauthenticated');
   const res = UrlFetchApp.fetch('https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(idToken), { muteHttpExceptions: true });
   if (res.getResponseCode() !== 200) throw new Error('unauthenticated');
   const info = JSON.parse(res.getContentText());
-  const props = PropertiesService.getScriptProperties();
-  if (info.aud !== props.getProperty('GOOGLE_CLIENT_ID')) throw new Error('unauthenticated');
+  if (info.aud !== PropertiesService.getScriptProperties().getProperty('GOOGLE_CLIENT_ID')) throw new Error('unauthenticated');
   if (String(info.email_verified) !== 'true') throw new Error('unauthenticated');
 
   const email = String(info.email).toLowerCase();
-  const list = (k) => (props.getProperty(k) || '').split(',').map((s) => s.trim().toLowerCase()).filter(String);
-  let role = null;
-  if (list('PARENT_EMAILS').indexOf(email) >= 0) role = 'parent';
-  else if (list('CHILD_EMAILS').indexOf(email) >= 0) role = 'child';
-  if (!role) throw new Error('forbidden');
+  const user = { email: email, role: roleOf_(email) };
+  const store = PropertiesService.getDocumentProperties();
+  const now = Date.now();
+  // 期限切れのセッションを片付ける
+  const all = store.getProperties();
+  Object.keys(all).forEach((k) => {
+    if (k.indexOf('sess_') === 0 && JSON.parse(all[k]).exp < now) store.deleteProperty(k);
+  });
+  const session = Utilities.getUuid() + Utilities.getUuid();
+  store.setProperty(sessionKey_(session), JSON.stringify({ email: email, exp: now + SESSION_DAYS * 864e5 }));
+  return { session: session, user: user };
+}
 
-  const user = { email: email, role: role };
-  const ttl = Math.max(0, Math.min(600, Number(info.exp) - Math.floor(Date.now() / 1000)));
-  if (ttl > 0) cache.put(key, JSON.stringify(user), ttl);
-  return user;
+function authenticate_(session) {
+  if (!session) throw new Error('unauthenticated');
+  const raw = PropertiesService.getDocumentProperties().getProperty(sessionKey_(session));
+  if (!raw) throw new Error('unauthenticated');
+  const s = JSON.parse(raw);
+  if (s.exp < Date.now()) throw new Error('unauthenticated');
+  // 役割は毎回スクリプトプロパティから決める（家族の登録を外せば、すぐ使えなくなる）
+  return { email: s.email, role: roleOf_(s.email) };
+}
+
+function roleOf_(email) {
+  const props = PropertiesService.getScriptProperties();
+  const list = (k) => (props.getProperty(k) || '').split(',').map((s) => s.trim().toLowerCase()).filter(String);
+  if (list('PARENT_EMAILS').indexOf(email) >= 0) return 'parent';
+  if (list('CHILD_EMAILS').indexOf(email) >= 0) return 'child';
+  throw new Error('forbidden');
+}
+
+function sessionKey_(session) {
+  return 'sess_' + Utilities.base64EncodeWebSafe(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, session));
 }
 
 // ---- アクション ----
