@@ -587,6 +587,9 @@ window.addEventListener('hashchange', () => {
   window.scrollTo(0, 0);
 });
 
+// iPhone はビューポートの指定だけではピンチ操作の拡大を止められないため
+document.addEventListener('gesturestart', (e) => e.preventDefault());
+
 // ---------- 起動 ----------
 
 if ('serviceWorker' in navigator) {
