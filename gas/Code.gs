@@ -375,8 +375,9 @@ const ACTIONS = {
     run: (p) => {
       const image = String(p.image || '');
       if (!image || image.length > 4000000) throw new Error('bad_image');
-      const file = receiptFolder_().createFile(Utilities.newBlob(Utilities.base64Decode(image), 'image/jpeg', 'receipt-' + today_() + '-' + uid_() + '.jpg'));
-      const result = { receiptId: file.getId(), amount: 0, store: '', category: 'その他', date: '', unclear: true };
+      const blob = Utilities.newBlob(Utilities.base64Decode(image), 'image/jpeg', 'receipt-' + today_() + '-' + uid_() + '.jpg');
+      const file = Drive.Files.create({ name: blob.getName(), parents: [receiptFolder_()], mimeType: 'image/jpeg' }, blob);
+      const result = { receiptId: file.id, amount: 0, store: '', category: 'その他', date: '', unclear: true };
       try {
         Object.assign(result, readReceipt_(image));
       } catch (err) {
@@ -492,19 +493,21 @@ function coachReview_(month, comment) {
 }
 
 // ---- レシートの写真（ドライブ） ----
+// DriveApp はドライブ全体の権限が要るため、このアプリが作ったファイルだけを扱える Drive API（drive.file）を使う
 
+// レシートを入れるフォルダの ID
 function receiptFolder_() {
   const id = getMeta_('receiptFolderId');
   if (id) {
     try {
-      return DriveApp.getFolderById(String(id));
+      if (!Drive.Files.get(String(id), { fields: 'id,trashed' }).trashed) return String(id);
     } catch (err) {
       // フォルダが消されていたら作り直す
     }
   }
-  const folder = DriveApp.createFolder('おこづかい帳レシート');
-  setMeta_('receiptFolderId', folder.getId());
-  return folder;
+  const folder = Drive.Files.create({ name: 'おこづかい帳レシート', mimeType: 'application/vnd.google-apps.folder' });
+  setMeta_('receiptFolderId', folder.id);
+  return folder.id;
 }
 
 // 承認した月のレシートの写真をゴミ箱に移す（30日間は戻せる）
@@ -513,7 +516,7 @@ function trashReceipts_(month) {
     if (String(t.date).slice(0, 7) !== month || !t.receiptUrl) return;
     const m = String(t.receiptUrl).match(/\/d\/([\w-]+)/);
     try {
-      if (m) DriveApp.getFileById(m[1]).setTrashed(true);
+      if (m) Drive.Files.update({ trashed: true }, m[1]);
       writeRow_('tx', i + 2, Object.assign({}, t, { receiptUrl: '' }));
     } catch (err) {
       console.warn('trash failed: ' + err.message);
