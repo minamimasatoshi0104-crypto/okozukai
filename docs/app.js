@@ -131,7 +131,8 @@ async function onGoogleLogin(res) {
     setSession(data.session);
     S.user = data.user;
   } catch (e) {
-    if (!S.user) renderLogin(e.message === 'forbidden' ? 'このアカウントは登録されていません。' : 'ログインできませんでした。もう一度試してください。');
+    // 原因を調べられるよう、失敗の理由を添える
+    if (!S.user) renderLogin(e.message === 'forbidden' ? 'このアカウントは登録されていません。' : 'ログインできませんでした。もう一度試してください。（' + e.message + '）');
     return;
   }
   await load(thisMonth());
