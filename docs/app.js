@@ -26,6 +26,7 @@ const S = {
   reportBlob: null,
   receiptDraft: null,
   reading: false,
+  asChild: false,
 };
 
 const app = document.getElementById('app');
@@ -97,6 +98,11 @@ function icon(name, size) {
   const s = size || 24;
   return '<svg width="' + s + '" height="' + s + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + ICON[name] + '</svg>';
 }
+// 画面の役割。保護者が本人の画面に切り替えているときは child
+function role() {
+  return S.asChild ? 'child' : S.user.role;
+}
+
 function markPill(m) {
   if (!m) return '';
   const name = m === 1 ? 'check' : m === 2 ? 'eye' : 'stop';
@@ -168,6 +174,7 @@ function renderMessage(message, retry) {
 
 function signOut(message) {
   setSession(null);
+  S.asChild = false;
   S.user = null;
   S.data = null;
   renderLogin(message);
@@ -180,7 +187,7 @@ async function api(action, params) {
   const res = await fetch(CFG.apiUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-    body: JSON.stringify({ action: action, params: params || {}, session: S.session }),
+    body: JSON.stringify({ action: action, params: params || {}, session: S.session, asChild: S.asChild }),
   });
   const json = await res.json();
   if (!json.ok && action !== 'login') {
@@ -339,7 +346,7 @@ function route() {
 }
 
 function nav(current) {
-  const parent = S.user && S.user.role === 'parent';
+  const parent = S.user && role() === 'parent';
   const items = parent
     ? [['home', 'ホーム', 'home'], ['history', '履歴', 'list'], ['check', 'チェック', 'eye'], ['archive', '振り返り', 'chart']]
     : [['home', 'ホーム', 'home'], ['input', '入力', 'plus'], ['history', '履歴', 'list'], ['archive', '振り返り', 'chart']];
@@ -372,6 +379,7 @@ function itemRow(t, opts) {
     (t.edited ? '<span class="pill edited">修正あり</span>' : '') +
     (t.needsCheck ? '<span class="pill need">要確認</span>' : '') +
     (t.source === 'receipt' ? '<span class="pill plain">レシート</span>' : '') +
+    (t.createdBy === 'parent' && t.source !== 'allowance' ? '<span class="pill parent-in">保護者が入力</span>' : '') +
     markPill(t.mark || 0);
   const inner =
     '<span class="date">' + md(t.date) + '</span>' +
@@ -407,7 +415,7 @@ function viewHome() {
   const recent = d.rows.slice(0, 3);
   return (
     '<main class="main">' +
-    '<div class="spread"><div><div class="eyebrow">' + monthLabel(S.month) + 'のおこづかい帳</div><h1>' + (S.user.role === 'parent' ? '保護者ビュー' : 'おかえり！') + '</h1></div>' +
+    '<div class="spread"><div><div class="eyebrow">' + monthLabel(S.month) + 'のおこづかい帳</div><h1>' + (role() === 'parent' ? '保護者ビュー' : 'おかえり！') + '</h1></div>' +
     (isCurrent ? '' : '<button class="btn ghost" style="min-height:36px" data-act="month" data-m="' + thisMonth() + '">今月へ</button>') + '</div>' +
     '<section class="balance"><span style="font-size:13px;opacity:.85">' + (isCurrent ? 'いまの残高（記録上）' : '月末の残高（記録上）') + '</span>' +
     '<span class="big">' + yen(t.balance) + '</span>' +
@@ -420,7 +428,8 @@ function viewHome() {
       : '') +
     '<section class="list"><div class="spread" style="padding:12px 0 4px"><h2 style="margin:0;font-size:15px">最近の記録</h2><a href="#/history" style="font-size:13px;font-weight:700;text-decoration:none">すべて見る</a></div>' +
     (recent.length ? recent.map((x) => itemRow(x)).join('') : '<div class="empty">まだ記録がありません</div>') + '</section>' +
-    (S.user.role === 'child' ? '<a class="btn block" href="#/input" style="min-height:56px;font-size:16px">＋ 記録する</a>' : '<a class="btn parent block" href="#/check">収支明細をチェック</a>') +
+    (role() === 'child' ? '<a class="btn block" href="#/input" style="min-height:56px;font-size:16px">＋ 記録する</a>' : '<a class="btn parent block" href="#/check">収支明細をチェック</a>') +
+    (S.user.role === 'parent' && !S.asChild ? '<button class="btn ghost block" data-act="asChild" data-v="1">息子さんの画面で操作する</button>' : '') +
     '</main>'
   );
 }
@@ -431,7 +440,7 @@ function closeBanners() {
   const prev = shiftMonth(cur, -1);
   const banner = (cls, href, text) => '<a class="banner ' + cls + '" href="' + href + '">' + icon('flag', 20) + '<span style="flex:1">' + text + '</span><span aria-hidden="true">›</span></a>';
   const out = [];
-  if (S.user.role === 'parent') {
+  if (role() === 'parent') {
     (d.closes || []).filter((c) => c.status === 'submitted').forEach((c) => out.push(banner('parent', '#/report/' + c.month, '<strong>' + monthLabel(c.month) + 'の報告が届いています</strong>')));
     if (d.firstMonth && prev >= d.firstMonth && closeState(prev, closeOf(prev)) === 'overdue') out.push(banner('stop', '#/archive', monthLabel(prev) + 'の締めがまだです（要相談）'));
     return out.join('');
@@ -507,7 +516,7 @@ function viewEdit(id) {
     '<main class="main"><div class="row"><a class="back" href="#/history" aria-label="履歴に戻る">' + icon('back') + '</a><h1 style="font-size:20px">記録を修正</h1></div>' +
     '<section class="card"><span class="muted small">いまの記録</span><div class="spread"><span>' + md(t.date) + ' ' + h(t.name || t.category) + ' ・ ' + h(t.category) + '</span><strong>' + yen(t.amount) + '</strong></div>' +
     (t.mark ? '<div>' + markPill(t.mark) + '</div>' : '') +
-    (t.receiptUrl && S.user.role === 'parent' ? '<a href="' + h(t.receiptUrl) + '" target="_blank" rel="noopener">レシートの写真を見る</a>' : '') + '</section>' +
+    (t.receiptUrl && role() === 'parent' ? '<a href="' + h(t.receiptUrl) + '" target="_blank" rel="noopener">レシートの写真を見る</a>' : '') + '</section>' +
     (isLocked(t.date.slice(0, 7))
       ? '<div class="notice">この月は締めて提出済みのため、修正できません。直したいときは、保護者に差し戻してもらってください。</div>'
       : editForm(t, cats)) +
@@ -666,7 +675,7 @@ function viewReport(m) {
   const back = '<div class="row"><a class="back" href="#/archive" aria-label="振り返りに戻る">' + icon('back') + '</a><h1 style="font-size:20px">' + monthLabel(m) + 'の報告</h1></div>';
   if (!c || c.status === 'returned') return '<main class="main">' + back + '<p class="empty">まだ提出されていません</p></main>';
   const state = closeState(m, c);
-  const parent = S.user.role === 'parent';
+  const parent = role() === 'parent';
   return (
     '<main class="main">' + back +
     '<div class="row">' + closePill(state) + (c.late ? '<span class="pill stop">期限後に提出</span>' : '') + '</div>' +
@@ -704,7 +713,7 @@ function viewArchive() {
   const card = (x) => {
     const state = closeState(x.month, x.close);
     const c = x.close;
-    const href = c && c.status !== 'returned' ? '#/report/' + x.month : S.user.role === 'child' && ['due', 'returned', 'overdue'].indexOf(state) >= 0 ? '#/close/' + x.month : '#/month/' + x.month;
+    const href = c && c.status !== 'returned' ? '#/report/' + x.month : role() === 'child' && ['due', 'returned', 'overdue'].indexOf(state) >= 0 ? '#/close/' + x.month : '#/month/' + x.month;
     return (
       '<a class="card" href="' + href + '" style="text-decoration:none;color:inherit;gap:8px">' +
       '<div class="spread"><h2>' + monthLabel(x.month) + '</h2>' + closePill(state) + '</div>' +
@@ -732,7 +741,7 @@ function render() {
     app.innerHTML = '<main class="main"><p class="empty">読み込み中…</p></main>';
     return;
   }
-  const parent = S.user.role === 'parent';
+  const parent = role() === 'parent';
   document.body.classList.toggle('parent-mode', parent && r.name === 'check');
   // 月を指定する画面は、その月のデータがそろってから描く
   if (['close', 'report', 'month'].indexOf(r.name) >= 0 && r.id) {
@@ -762,7 +771,10 @@ function render() {
     archive: viewArchive,
   };
   const navName = { edit: 'history', presets: 'input', close: 'home', report: 'archive' }[r.name] || r.name;
-  app.innerHTML = (views[r.name] || viewHome)() + nav(navName);
+  const acting = S.asChild
+    ? '<div class="acting"><span>保護者が息子さんの画面で操作中</span><button data-act="asChild" data-v="0">保護者の画面に戻る</button></div>'
+    : '';
+  app.innerHTML = acting + (views[r.name] || viewHome)() + nav(navName);
   if (r.name === 'report') fillReport(r.id);
 }
 
@@ -976,6 +988,13 @@ app.addEventListener('click', async (e) => {
   if (act === 'retry') {
     S.failedMonth = null;
     return S.user ? render() : start();
+  }
+  if (act === 'asChild') {
+    S.asChild = el.dataset.v === '1';
+    S.receiptDraft = null;
+    S.archive = null;
+    location.hash = '#/home';
+    return load(thisMonth());
   }
   if (act === 'receiptCancel') {
     S.receiptDraft = null;

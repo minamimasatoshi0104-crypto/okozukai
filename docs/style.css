@@ -124,3 +124,8 @@ label.field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; 
 /* iPhone では display:none のファイル選択欄がラベルから開かないことがあるため、見えなくするだけにする */
 .visually-hidden { position: absolute; width: 1px; height: 1px; opacity: 0; overflow: hidden; }
 label.btn { position: relative; }
+
+/* 保護者が本人の画面で操作しているとき */
+.acting { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 16px; background: var(--parent); color: #fff; font-size: 12px; font-weight: 700; }
+.acting button { min-height: 32px; padding: 0 10px; border: 0; border-radius: 8px; background: #fff; color: var(--parent); font-weight: 700; font-size: 12px; }
+.pill.parent-in { background: var(--parent-soft); color: var(--parent); }

@@ -12,7 +12,8 @@
 
 const SHEETS = {
   // 記録は削除しない。取り消しは voided=TRUE にして残す
-  tx: ['id', 'createdAt', 'date', 'type', 'category', 'name', 'amount', 'memo', 'receiptUrl', 'source', 'needsCheck', 'edited', 'voided', 'mark', 'markedAt', 'markedBy'],
+  // createdBy は後から足した列。保護者が本人の画面で入力した記録は parent になる
+  tx: ['id', 'createdAt', 'date', 'type', 'category', 'name', 'amount', 'memo', 'receiptUrl', 'source', 'needsCheck', 'edited', 'voided', 'mark', 'markedAt', 'markedBy', 'createdBy'],
   edits: ['id', 'txId', 'editedAt', 'editor', 'before', 'after', 'reason'],
   presets: ['id', 'label', 'category', 'amount', 'order'],
   meta: ['key', 'value'],
@@ -55,7 +56,9 @@ function doPost(e) {
   }
   try {
     if (body.action === 'login') return json_({ ok: true, data: login_((body.params || {}).idToken) });
-    const user = authenticate_(body.session);
+    let user = authenticate_(body.session);
+    // 保護者は本人の画面に切り替えて操作できる（テストや代わりの入力のため）。操作した人は記録に残す
+    if (body.asChild && user.role === 'parent') user = { email: user.email, role: 'child', actingParent: true };
     const handler = ACTIONS[body.action];
     if (!handler) return json_({ ok: false, error: 'unknown_action' });
     if (handler.role && handler.role !== user.role) return json_({ ok: false, error: 'forbidden' });
@@ -72,7 +75,7 @@ function doPost(e) {
 }
 
 // 公開中の版を外から確かめられるよう、更新のたびに上げる
-const VERSION = 5;
+const VERSION = 6;
 
 function doGet() {
   return json_({ ok: true, service: 'okozukai', version: VERSION });
@@ -184,6 +187,7 @@ const ACTIONS = {
       t.mark = 0;
       t.markedAt = '';
       t.markedBy = '';
+      t.createdBy = user.actingParent ? 'parent' : 'child';
       append_('tx', t);
       return t;
     },
@@ -213,7 +217,7 @@ const ACTIONS = {
       const mark = Number(before.mark) === 1 ? 0 : before.mark;
       const updated = Object.assign({}, before, a, { edited: true, needsCheck: false, mark: mark });
       writeRow_('tx', found.row, updated);
-      append_('edits', { id: uid_(), txId: before.id, editedAt: Date.now(), editor: user.role, before: JSON.stringify(b), after: JSON.stringify(a), reason: reason });
+      append_('edits', { id: uid_(), txId: before.id, editedAt: Date.now(), editor: user.actingParent ? 'parent' : user.role, before: JSON.stringify(b), after: JSON.stringify(a), reason: reason });
       return updated;
     },
   },
@@ -314,7 +318,7 @@ const ACTIONS = {
         append_('tx', {
           id: uid_(), createdAt: now, date: today_() < nextFirst ? nextFirst : today_(), type: 'income', category: 'おこづかい',
           name: Number(found.obj.month.slice(5)) + '月分のおこづかい', amount: allowance, memo: '', receiptUrl: '',
-          source: 'allowance', needsCheck: false, edited: false, voided: false, mark: 0, markedAt: '', markedBy: '',
+          source: 'allowance', needsCheck: false, edited: false, voided: false, mark: 0, markedAt: '', markedBy: '', createdBy: 'parent',
         });
       }
       const row = Object.assign({}, found.obj, { status: 'approved', approvedAt: now, allowance: allowance, parentComment: String(p.comment || '').trim().slice(0, 200) });
@@ -587,6 +591,7 @@ function validateTx_(p) {
     mark: Number(p.mark) || 0,
     markedAt: p.markedAt || '',
     markedBy: p.markedBy || '',
+    createdBy: p.createdBy || '',
   };
 }
 
