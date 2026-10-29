@@ -68,8 +68,11 @@ function doPost(e) {
   }
 }
 
+// 公開中の版を外から確かめられるよう、更新のたびに上げる
+const VERSION = 3;
+
 function doGet() {
-  return json_({ ok: true, service: 'okozukai' });
+  return json_({ ok: true, service: 'okozukai', version: VERSION });
 }
 
 // ---- 認証 ----
@@ -79,12 +82,13 @@ function doGet() {
 const SESSION_DAYS = 180;
 
 function login_(idToken) {
-  if (!idToken) throw new Error('unauthenticated');
+  // どこで弾かれたか分かるよう、理由ごとに別の値を返す
+  if (!idToken) throw new Error('unauthenticated:no_token');
   const res = UrlFetchApp.fetch('https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(idToken), { muteHttpExceptions: true });
-  if (res.getResponseCode() !== 200) throw new Error('unauthenticated');
+  if (res.getResponseCode() !== 200) throw new Error('unauthenticated:tokeninfo_' + res.getResponseCode());
   const info = JSON.parse(res.getContentText());
-  if (info.aud !== PropertiesService.getScriptProperties().getProperty('GOOGLE_CLIENT_ID')) throw new Error('unauthenticated');
-  if (String(info.email_verified) !== 'true') throw new Error('unauthenticated');
+  if (info.aud !== (PropertiesService.getScriptProperties().getProperty('GOOGLE_CLIENT_ID') || '').trim()) throw new Error('unauthenticated:aud');
+  if (String(info.email_verified) !== 'true') throw new Error('unauthenticated:unverified');
 
   const email = String(info.email).toLowerCase();
   const user = { email: email, role: roleOf_(email) };
