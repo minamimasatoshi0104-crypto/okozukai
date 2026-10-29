@@ -20,6 +20,10 @@ const S = {
   inputCat: '食べ物',
   filter: 'all',
   presetDraft: null,
+  failedMonth: null,
+  archive: null,
+  closeCash: null,
+  reportBlob: null,
 };
 
 const app = document.getElementById('app');
@@ -83,6 +87,8 @@ const ICON = {
   check: '<path d="m5 12 5 5 9-10"/>',
   stop: '<path d="M8 2.5h8l5.5 5.5v8L16 21.5H8L2.5 16V8z"/><path d="M7.5 12h9"/>',
   back: '<path d="m15 5-7 7 7 7"/>',
+  chart: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
+  flag: '<path d="M5 21V4h11l-1.5 4L16 12H5"/>',
 };
 function icon(name, size) {
   const s = size || 24;
@@ -190,6 +196,14 @@ const ERRORS = {
   bad_date: '日付を正しく入れてください',
   no_change: '変更がありません',
   forbidden: 'この操作はできません',
+  month_locked: 'この月は締めて提出済みのため、記録を変えられません',
+  not_yet: 'まだ締めの期間ではありません',
+  has_stop: 'ストップのマークがあるので、まだ締められません',
+  not_matched: '手元の現金と記録が合っていません',
+  already_closed: 'この月はもう提出済みです',
+  comment_required: '今月のひとことを書いてください',
+  not_submitted: 'この月の報告は、承認や差し戻しができる状態ではありません',
+  bad_allowance: 'おこづかいの金額を正しく入れてください',
 };
 function fail(err) {
   toast(ERRORS[err.message] || '通信に失敗しました。もう一度試してください');
@@ -201,7 +215,9 @@ async function load(month) {
   render();
   try {
     S.data = await api('month', { month: S.month });
+    S.failedMonth = null;
   } catch (e) {
+    S.failedMonth = S.month;
     fail(e);
   } finally {
     S.loading = false;
@@ -262,6 +278,55 @@ function donut(byCat, total) {
   );
 }
 
+// ---------- 月末の締め ----------
+
+function lastDay(m) {
+  const [y, mo] = m.split('-').map(Number);
+  return m + '-' + String(new Date(y, mo, 0).getDate()).padStart(2, '0');
+}
+function deadline(m) {
+  return shiftMonth(m, 1) + '-03';
+}
+function closeOf(m) {
+  return (S.data.closes || []).filter((c) => c.month === m)[0] || null;
+}
+// 提出済み・承認済みの月は、差し戻されるまで記録を変えられない
+function isLocked(m) {
+  const c = closeOf(m);
+  return !!c && c.status !== 'returned';
+}
+// open（集計中）/ due（締めの期間）/ returned / overdue（要相談）/ submitted / approved
+function closeState(m, c) {
+  if (c && c.status === 'approved') return 'approved';
+  if (c && c.status === 'submitted') return 'submitted';
+  const t = today();
+  if (t < lastDay(m)) return 'open';
+  if (t <= deadline(m)) return c ? 'returned' : 'due';
+  return 'overdue';
+}
+const CLOSE_LABEL = {
+  open: ['集計中', 'plain'],
+  due: ['締めの期間', 'need'],
+  returned: ['差し戻し', 'need'],
+  overdue: ['要相談', 'stop'],
+  submitted: ['承認待ち', 'check'],
+  approved: ['承認済み', 'ok'],
+};
+function closePill(state) {
+  return '<span class="pill ' + CLOSE_LABEL[state][1] + '">' + CLOSE_LABEL[state][0] + '</span>';
+}
+// 締めた後に使ったお金は、翌月1日の日付で記録する
+function inputDate() {
+  return isLocked(thisMonth()) ? shiftMonth(thisMonth(), 1) + '-01' : today();
+}
+
+// 表示に必要な月のデータがなければ読み込む（読み込み中は false）
+function ensureMonth(m) {
+  if (S.data && S.data.month === m) return true;
+  if (!S.loading && S.failedMonth !== m) load(m);
+  return false;
+}
+
 // ---------- 画面 ----------
 
 function route() {
@@ -272,8 +337,8 @@ function route() {
 function nav(current) {
   const parent = S.user && S.user.role === 'parent';
   const items = parent
-    ? [['home', 'ホーム', 'home'], ['history', '履歴', 'list'], ['check', 'チェック', 'eye']]
-    : [['home', 'ホーム', 'home'], ['input', '入力', 'plus'], ['history', '履歴', 'list']];
+    ? [['home', 'ホーム', 'home'], ['history', '履歴', 'list'], ['check', 'チェック', 'eye'], ['archive', '振り返り', 'chart']]
+    : [['home', 'ホーム', 'home'], ['input', '入力', 'plus'], ['history', '履歴', 'list'], ['archive', '振り返り', 'chart']];
   return (
     '<nav class="nav" aria-label="メニュー"><div class="nav-inner">' +
     items
@@ -342,6 +407,7 @@ function viewHome() {
     '<section class="balance"><span style="font-size:13px;opacity:.85">' + (isCurrent ? 'いまの残高（記録上）' : '月末の残高（記録上）') + '</span>' +
     '<span class="big">' + yen(t.balance) + '</span>' +
     '<div class="stats"><span>収入 <strong>' + yen(t.income) + '</strong></span><span>支出 <strong>' + yen(t.expense) + '</strong></span><span>繰越 <strong>' + yen(d.opening) + '</strong></span></div></section>' +
+    closeBanners() +
     watch +
     (t.expense
       ? '<section class="card"><h2>何に使った？</h2><div class="donut-wrap">' + donut(t.byCat, t.expense) +
@@ -352,6 +418,29 @@ function viewHome() {
     (S.user.role === 'child' ? '<a class="btn block" href="#/input" style="min-height:56px;font-size:16px">＋ 記録する</a>' : '<a class="btn parent block" href="#/check">収支明細をチェック</a>') +
     '</main>'
   );
+}
+
+function closeBanners() {
+  const d = S.data;
+  const cur = thisMonth();
+  const prev = shiftMonth(cur, -1);
+  const banner = (cls, href, text) => '<a class="banner ' + cls + '" href="' + href + '">' + icon('flag', 20) + '<span style="flex:1">' + text + '</span><span aria-hidden="true">›</span></a>';
+  const out = [];
+  if (S.user.role === 'parent') {
+    (d.closes || []).filter((c) => c.status === 'submitted').forEach((c) => out.push(banner('parent', '#/report/' + c.month, '<strong>' + monthLabel(c.month) + 'の報告が届いています</strong>')));
+    if (d.firstMonth && prev >= d.firstMonth && closeState(prev, closeOf(prev)) === 'overdue') out.push(banner('stop', '#/archive', monthLabel(prev) + 'の締めがまだです（要相談）'));
+    return out.join('');
+  }
+  [prev, cur].forEach((m) => {
+    if (!d.firstMonth || m < d.firstMonth) return;
+    const state = closeState(m, closeOf(m));
+    const by = Number(deadline(m).slice(5, 7)) + '/3まで';
+    if (state === 'due') out.push(banner('warn', '#/close/' + m, '<strong>' + monthLabel(m) + 'の締めをしよう</strong>（' + by + '）'));
+    if (state === 'returned') out.push(banner('warn', '#/close/' + m, '<strong>' + monthLabel(m) + 'の報告が差し戻されました</strong>（' + by + '）'));
+    if (state === 'overdue') out.push(banner('stop', '#/close/' + m, '<strong>' + monthLabel(m) + 'の締めが期限切れです</strong>（要相談）'));
+    if (state === 'submitted') out.push(banner('parent', '#/report/' + m, monthLabel(m) + 'の報告は承認待ちです'));
+  });
+  return out.join('');
 }
 
 function viewInput() {
@@ -369,7 +458,8 @@ function viewInput() {
     '<label class="field">金額<input name="amount" type="number" inputmode="numeric" min="1" placeholder="0" required></label>' +
     '<div class="chips">' + cats.map((c) => '<button type="button" class="cat" data-act="cat" data-v="' + h(c) + '" aria-pressed="' + (c === S.inputCat) + '">' + h(c) + '</button>').join('') + '</div>' +
     '<label class="field">内容（お店・買ったもの）<input name="name" type="text" maxlength="50" placeholder="例：ローソンでおにぎり"></label>' +
-    '<label class="field">日付<input name="date" type="date" value="' + today() + '" max="' + today() + '" required></label>' +
+    '<label class="field">日付<input name="date" type="date" value="' + inputDate() + '" max="' + inputDate() + '" required></label>' +
+    (isLocked(thisMonth()) ? '<div class="notice">今月は締めて提出済みです。今日使ったお金は、来月1日の日付で記録します。</div>' : '') +
     '<button class="btn block" type="submit">記録する</button></form>' +
     '</main>'
   );
@@ -402,6 +492,18 @@ function viewEdit(id) {
     '<main class="main"><div class="row"><a class="back" href="#/history" aria-label="履歴に戻る">' + icon('back') + '</a><h1 style="font-size:20px">記録を修正</h1></div>' +
     '<section class="card"><span class="muted small">いまの記録</span><div class="spread"><span>' + md(t.date) + ' ' + h(t.name || t.category) + ' ・ ' + h(t.category) + '</span><strong>' + yen(t.amount) + '</strong></div>' +
     (t.mark ? '<div>' + markPill(t.mark) + '</div>' : '') + '</section>' +
+    (isLocked(t.date.slice(0, 7))
+      ? '<div class="notice">この月は締めて提出済みのため、修正できません。直したいときは、保護者に差し戻してもらってください。</div>'
+      : editForm(t, cats)) +
+    (log.length
+      ? '<section class="card"><h2>この記録の変更履歴</h2>' + log.map(editLogItem).join('') + '</section>'
+      : '') +
+    '</main>'
+  );
+}
+
+function editForm(t, cats) {
+  return (
     '<form class="card" data-form="edit" data-id="' + h(t.id) + '">' +
     '<label class="field">正しい金額<input name="amount" type="number" inputmode="numeric" min="1" value="' + t.amount + '" required></label>' +
     '<label class="field">分類<select name="category">' + cats.map((c) => '<option' + (c === t.category ? ' selected' : '') + '>' + h(c) + '</option>').join('') + '</select></label>' +
@@ -410,11 +512,7 @@ function viewEdit(id) {
     '<label class="row small" style="gap:8px;min-height:44px"><input name="voided" type="checkbox"' + (t.voided ? ' checked' : '') + ' style="width:22px;height:22px">この記録を取り消す（二重に記録したときなど）</label>' +
     '<label class="field required">修正する理由（必須）<textarea name="reason" rows="3" required></textarea></label>' +
     '<div class="notice">修正前の記録と理由は「変更履歴」に残り、保護者も見られます。記録を消すことはできません。</div>' +
-    '<button class="btn block" type="submit">修正を保存</button></form>' +
-    (log.length
-      ? '<section class="card"><h2>この記録の変更履歴</h2>' + log.map(editLogItem).join('') + '</section>'
-      : '') +
-    '</main>'
+    '<button class="btn block" type="submit">修正を保存</button></form>'
   );
 }
 
@@ -471,6 +569,124 @@ function viewPresets() {
   );
 }
 
+function viewClose(m) {
+  const d = S.data;
+  const c = closeOf(m);
+  const state = closeState(m, c);
+  const t = totals(d);
+  const head = '<div class="row"><a class="back" href="#/home" aria-label="ホームに戻る">' + icon('back') + '</a><h1 style="font-size:20px">' + monthLabel(m) + 'の締め</h1></div>';
+  if (state === 'submitted' || state === 'approved') {
+    return '<main class="main">' + head + '<div class="notice">この月はもう提出しました。</div><a class="btn block" href="#/report/' + m + '">報告カードを見る</a></main>';
+  }
+  if (state === 'open') {
+    return '<main class="main">' + head + '<div class="notice">締めは、' + md(lastDay(m)) + '（月末）から ' + md(deadline(m)) + ' までにします。</div></main>';
+  }
+  let body = '';
+  if (c && c.returnReason) body += '<div class="banner warn" style="flex-direction:column;align-items:flex-start"><strong>保護者から差し戻されました</strong><span>' + h(c.returnReason) + '</span></div>';
+  if (state === 'overdue') body += '<div class="banner stop">期限（' + md(deadline(m)) + '）を過ぎています。提出したあと、おこづかいは保護者と相談して決めます。</div>';
+  if (t.marks[3]) {
+    return '<main class="main">' + head + body +
+      '<section class="card"><h2>' + markPill(3) + ' ストップが ' + t.marks[3] + ' 件あります</h2>' +
+      '<p class="muted" style="margin:0">保護者と話して、ストップを外してもらうまで締められません。</p>' +
+      '<a class="btn ghost block" href="#/history">履歴で確かめる</a></section></main>';
+  }
+  if (S.closeCash === null) {
+    body +=
+      '<form class="card" data-form="cash"><h2>① 手元の現金を数えよう</h2>' +
+      '<p class="muted" style="margin:0">財布や貯金箱など、いま持っている現金を全部数えて入れてください。</p>' +
+      '<label class="field">手元の現金<input name="cash" type="number" inputmode="numeric" min="0" required></label>' +
+      '<button class="btn block" type="submit">記録と比べる</button></form>';
+    return '<main class="main">' + head + body + '</main>';
+  }
+  const diff = S.closeCash - t.balance;
+  body +=
+    '<section class="card"><h2>① 手元の現金と記録</h2>' +
+    '<div class="spread"><span>手元の現金</span><strong>' + yen(S.closeCash) + '</strong></div>' +
+    '<div class="spread"><span>記録上の残高</span><strong>' + yen(t.balance) + '</strong></div>' +
+    '<div class="spread" style="color:' + (diff ? 'var(--warn)' : 'var(--accent)') + '"><strong>' + (diff ? '差額' : 'ぴったり！') + '</strong><strong>' + (diff ? (diff > 0 ? '+' : '−') + yen(Math.abs(diff)) : '✓') + '</strong></div>' +
+    '<button class="btn ghost" data-act="recount">数え直す</button></section>';
+  if (diff) {
+    const short = diff < 0;
+    body +=
+      '<form class="card" data-form="diff" data-month="' + m + '" data-type="' + (short ? 'expense' : 'income') + '" data-amount="' + Math.abs(diff) + '">' +
+      '<h2>② 差額を記録して合わせよう</h2>' +
+      '<p class="muted" style="margin:0">' + (short
+        ? '記録より ' + yen(-diff) + ' 少ないです。思い出せたら、先に「入力」から正しく記録してください。思い出せない分は「使途不明」として記録します。'
+        : '記録より ' + yen(diff) + ' 多いです。記録していない収入があるはずです。分類を選んで記録します。') + '</p>' +
+      (short ? '' : '<label class="field">分類<select name="category">' + d.categories.income.filter((x) => x !== 'おこづかい').map((x) => '<option' + (x === 'その他収入' ? ' selected' : '') + '>' + h(x) + '</option>').join('') + '</select></label>') +
+      '<label class="field required">理由（必須）<textarea name="reason" rows="2" required placeholder="' + (short ? '例：コンビニで買ったけどレシートがない' : '例：おじいちゃんからもらった') + '"></textarea></label>' +
+      '<button class="btn block" type="submit">' + yen(Math.abs(diff)) + ' を' + (short ? '使途不明' : '収入') + 'として記録する</button></form>';
+  } else {
+    body +=
+      '<form class="card" data-form="close" data-month="' + m + '"><h2>② 今月のひとこと</h2>' +
+      '<label class="field required">ひとこと（必須）<input name="comment" type="text" maxlength="100" required placeholder="例：遊びに使いすぎたので来月は気をつける"></label>' +
+      '<button class="btn block" type="submit">保護者に提出する</button></form>';
+  }
+  return '<main class="main">' + head + body + '</main>';
+}
+
+function viewReport(m) {
+  const c = closeOf(m);
+  const back = '<div class="row"><a class="back" href="#/archive" aria-label="振り返りに戻る">' + icon('back') + '</a><h1 style="font-size:20px">' + monthLabel(m) + 'の報告</h1></div>';
+  if (!c || c.status === 'returned') return '<main class="main">' + back + '<p class="empty">まだ提出されていません</p></main>';
+  const state = closeState(m, c);
+  const parent = S.user.role === 'parent';
+  return (
+    '<main class="main">' + back +
+    '<div class="row">' + closePill(state) + (c.late ? '<span class="pill stop">期限後に提出</span>' : '') + '</div>' +
+    '<img id="report-img" class="report-img" alt="' + monthLabel(m) + 'の報告カード">' +
+    '<div class="presets"><button class="btn" data-act="share">' + (parent ? '共有・保存' : 'LINEで送る・保存') + '</button><button class="btn ghost" data-act="download">画像をダウンロード</button></div>' +
+    (parent && c.status === 'submitted'
+      ? '<form class="card" data-form="approve" data-month="' + m + '"><h2>承認する</h2>' +
+        '<label class="field">渡すおこづかい（円）<input name="allowance" type="number" inputmode="numeric" min="0" value="3000" required></label>' +
+        '<label class="field">ひとこと（任意）<textarea name="comment" rows="2" maxlength="200"></textarea></label>' +
+        '<p class="muted small" style="margin:0">承認すると、この金額が「おこづかい」の収入として記録されます（日付は今日。月末日に承認したときは翌月1日）。</p>' +
+        '<button class="btn parent block" type="submit">承認する</button></form>' +
+        '<form class="card" data-form="return" data-month="' + m + '"><h2>差し戻す</h2>' +
+        '<label class="field required">理由（必須）<textarea name="reason" rows="2" required></textarea></label>' +
+        '<button class="btn ghost block" type="submit">差し戻す</button></form>'
+      : '') +
+    '<a class="btn ghost block" href="#/history">この月の履歴を見る</a>' +
+    '</main>'
+  );
+}
+
+function viewArchive() {
+  const a = S.archive;
+  const months = a.months;
+  if (!months.length) return '<main class="main"><h1>振り返り</h1><p class="empty">まだ記録がありません</p></main>';
+  const chart = months.slice(0, 12).reverse();
+  const max = Math.max(100, ...chart.map((x) => x.unknown));
+  const bw = 300 / chart.length;
+  const bars = chart.map((x, i) => {
+    const hgt = Math.round((x.unknown / max) * 90);
+    return '<rect x="' + (i * bw + bw * 0.2).toFixed(1) + '" y="' + (100 - hgt) + '" width="' + (bw * 0.6).toFixed(1) + '" height="' + Math.max(hgt, x.unknown ? 2 : 0) + '" rx="3" fill="#C2410C"><title>' + monthLabel(x.month) + ' ' + yen(x.unknown) + '</title></rect>' +
+      '<text x="' + (i * bw + bw / 2).toFixed(1) + '" y="116" text-anchor="middle" font-size="10" fill="#55625D">' + Number(x.month.slice(5)) + '月</text>' +
+      (x.unknown ? '<text x="' + (i * bw + bw / 2).toFixed(1) + '" y="' + (94 - hgt) + '" text-anchor="middle" font-size="10" fill="#9A3412">' + x.unknown.toLocaleString('ja-JP') + '</text>' : '');
+  }).join('');
+  const card = (x) => {
+    const state = closeState(x.month, x.close);
+    const c = x.close;
+    const href = c && c.status !== 'returned' ? '#/report/' + x.month : S.user.role === 'child' && ['due', 'returned', 'overdue'].indexOf(state) >= 0 ? '#/close/' + x.month : '#/month/' + x.month;
+    return (
+      '<a class="card" href="' + href + '" style="text-decoration:none;color:inherit;gap:8px">' +
+      '<div class="spread"><h2>' + monthLabel(x.month) + '</h2>' + closePill(state) + '</div>' +
+      '<div class="spread small"><span>支出 <strong>' + yen(x.expense) + '</strong></span><span>月末残高 <strong>' + yen(x.balance) + '</strong></span><span style="color:' + (x.unknown ? 'var(--warn)' : 'var(--sub)') + '">使途不明 <strong>' + yen(x.unknown) + '</strong></span></div>' +
+      (c && c.comment ? '<div class="small">本人：' + h(c.comment) + '</div>' : '') +
+      (c && c.parentComment ? '<div class="small" style="color:var(--parent)">保護者：' + h(c.parentComment) + '</div>' : '') +
+      (c && c.status === 'approved' ? '<div class="small muted">おこづかい ' + yen(c.allowance) + '</div>' : '') +
+      '</a>'
+    );
+  };
+  return (
+    '<main class="main"><h1>振り返り</h1>' +
+    '<section class="card"><h2>使途不明の推移</h2>' +
+    '<svg viewBox="0 0 300 120" width="100%" role="img" aria-label="月ごとの使途不明の金額"><line x1="0" y1="100" x2="300" y2="100" stroke="#DDE3DF"/>' + bars + '</svg></section>' +
+    months.map(card).join('') +
+    '</main>'
+  );
+}
+
 function render() {
   if (!S.user) return;
   const r = route();
@@ -480,6 +696,22 @@ function render() {
   }
   const parent = S.user.role === 'parent';
   document.body.classList.toggle('parent-mode', parent && r.name === 'check');
+  // 月を指定する画面は、その月のデータがそろってから描く
+  if (['close', 'report', 'month'].indexOf(r.name) >= 0 && r.id) {
+    if (!ensureMonth(r.id)) {
+      app.innerHTML = '<main class="main"><p class="empty">' + (S.failedMonth === r.id ? '読み込めませんでした。<button class="btn ghost" data-act="retry">もう一度</button>' : '読み込み中…') + '</p></main>' + nav('home');
+      return;
+    }
+    if (r.name === 'month') {
+      location.replace('#/history');
+      return;
+    }
+  }
+  if (r.name === 'archive' && !S.archive) {
+    loadArchive();
+    app.innerHTML = '<main class="main"><h1>振り返り</h1><p class="empty">読み込み中…</p></main>' + nav('archive');
+    return;
+  }
   const views = {
     home: viewHome,
     input: parent ? viewHome : viewInput,
@@ -487,9 +719,184 @@ function render() {
     edit: () => viewEdit(r.id),
     check: parent ? viewCheck : viewHome,
     presets: parent ? viewHome : viewPresets,
+    close: parent ? viewHome : () => viewClose(r.id),
+    report: () => viewReport(r.id),
+    archive: viewArchive,
   };
-  const navName = r.name === 'edit' ? 'history' : r.name === 'presets' ? 'input' : r.name;
+  const navName = { edit: 'history', presets: 'input', close: 'home', report: 'archive' }[r.name] || r.name;
   app.innerHTML = (views[r.name] || viewHome)() + nav(navName);
+  if (r.name === 'report') fillReport(r.id);
+}
+
+let archiveLoading = false;
+async function loadArchive() {
+  if (archiveLoading) return;
+  archiveLoading = true;
+  try {
+    S.archive = await api('archive');
+  } catch (e) {
+    fail(e);
+    S.archive = { months: [] };
+  } finally {
+    archiveLoading = false;
+    render();
+  }
+}
+
+// ---------- 報告カード（画像） ----------
+
+const FONT_ROUND = "'M PLUS Rounded 1c', 'Hiragino Maru Gothic ProN', sans-serif";
+const FONT_TEXT = "'Noto Sans JP', 'Hiragino Sans', sans-serif";
+
+async function fillReport(m) {
+  const c = closeOf(m);
+  if (!c || c.status === 'returned') return;
+  const d = S.data;
+  S.reportBlob = null;
+  // 画像に描く文字のフォントを先に読み込む（日本語フォントは文字ごとに分かれて配信されるため）
+  const sample = monthLabel(m) + 'おこづかい報告月末の残高繰越収入支出手元の現金使途不明何に使った保護者のチェック見たよ注目中ストップ未チェック今月のひとこと保護者からありなしぴったり承認待ち済み期限後に提出¥0123456789,+−' + c.comment + (c.parentComment || '') + Object.keys(totals(d).byCat).join('');
+  if (document.fonts) {
+    await Promise.all(['800 30px', '700 16px', '400 14px'].map((w, i) => document.fonts.load(w + ' ' + (i < 2 ? FONT_ROUND : FONT_TEXT), sample).catch(() => {})));
+  }
+  const canvas = drawReport(m, d, c);
+  canvas.toBlob((blob) => {
+    const img = document.getElementById('report-img');
+    if (!img || route().id !== m) return;
+    S.reportBlob = blob;
+    img.src = URL.createObjectURL(blob);
+  }, 'image/png');
+}
+
+function drawReport(m, d, c) {
+  const W = 540;
+  const SC = 2;
+  const t = totals(d);
+  const work = document.createElement('canvas');
+  work.width = W * SC;
+  work.height = 2400 * SC;
+  const g = work.getContext('2d');
+  g.scale(SC, SC);
+  const rr = (x, y, w, hh, r, fill) => {
+    g.beginPath();
+    g.moveTo(x + r, y);
+    g.arcTo(x + w, y, x + w, y + hh, r);
+    g.arcTo(x + w, y + hh, x, y + hh, r);
+    g.arcTo(x, y + hh, x, y, r);
+    g.arcTo(x, y, x + w, y, r);
+    g.closePath();
+    g.fillStyle = fill;
+    g.fill();
+  };
+  const text = (s, x, y, font, color, align) => {
+    g.font = font;
+    g.fillStyle = color;
+    g.textAlign = align || 'left';
+    g.fillText(s, x, y);
+  };
+  const wrap = (s, width, font) => {
+    g.font = font;
+    const lines = [];
+    let line = '';
+    Array.from(String(s)).forEach((ch) => {
+      if (g.measureText(line + ch).width > width) {
+        lines.push(line);
+        line = ch;
+      } else line += ch;
+    });
+    if (line) lines.push(line);
+    return lines;
+  };
+  const state = closeState(m, c);
+  const X = 24;
+  const CW = W - X * 2;
+  g.textBaseline = 'alphabetic';
+  g.fillStyle = '#F4F6F3';
+  g.fillRect(0, 0, W, 2400);
+
+  // 見出し
+  rr(0, 0, W, 112, 0, '#0E5E4E');
+  text('おこづかい報告', X, 40, '700 15px ' + FONT_ROUND, 'rgba(255,255,255,0.85)');
+  text(monthLabel(m), X, 82, '800 32px ' + FONT_ROUND, '#FFFFFF');
+  rr(W - X - 96, 52, 96, 32, 16, '#FFFFFF');
+  text(CLOSE_LABEL[state][0], W - X - 48, 74, '700 15px ' + FONT_ROUND, '#0E5E4E', 'center');
+  let y = 132;
+
+  // 残高
+  rr(X, y, CW, 132, 20, '#FFFFFF');
+  text('月末の残高', X + 20, y + 30, '400 14px ' + FONT_TEXT, '#55625D');
+  text(yen(t.balance), X + 20, y + 80, '800 42px ' + FONT_ROUND, '#17211E');
+  text('繰越 ' + yen(d.opening) + '　収入 ' + yen(t.income) + '　支出 ' + yen(t.expense), X + 20, y + 112, '400 14px ' + FONT_TEXT, '#55625D');
+  y += 148;
+
+  // 現金と使途不明
+  const unknown = t.byCat['使途不明'] || 0;
+  rr(X, y, CW, 92, 20, '#FFFFFF');
+  text('手元の現金', X + 20, y + 34, '400 14px ' + FONT_TEXT, '#55625D');
+  text(yen(c.cash) + '（ぴったり）', X + CW - 20, y + 34, '700 16px ' + FONT_ROUND, '#0E5E4E', 'right');
+  text('使途不明', X + 20, y + 70, '400 14px ' + FONT_TEXT, '#55625D');
+  text(unknown ? yen(unknown) : 'なし', X + CW - 20, y + 70, '700 16px ' + FONT_ROUND, unknown ? '#9A3412' : '#17211E', 'right');
+  y += 108;
+
+  // 何に使った？
+  const cats = Object.keys(t.byCat).sort((a, b) => t.byCat[b] - t.byCat[a]);
+  const catH = 52 + Math.max(1, cats.length) * 30;
+  rr(X, y, CW, catH, 20, '#FFFFFF');
+  text('何に使った？', X + 20, y + 32, '700 16px ' + FONT_ROUND, '#17211E');
+  if (!cats.length) text('支出はありません', X + 20, y + 64, '400 14px ' + FONT_TEXT, '#55625D');
+  cats.forEach((k, i) => {
+    const ry = y + 52 + i * 30;
+    text(k, X + 20, ry + 15, '400 14px ' + FONT_TEXT, '#17211E');
+    rr(X + 110, ry + 4, CW - 230, 12, 6, '#EEF1EF');
+    rr(X + 110, ry + 4, Math.max(6, ((CW - 230) * t.byCat[k]) / t.expense), 12, 6, CAT_COLORS[k] || '#9AA5A0');
+    text(yen(t.byCat[k]), X + CW - 20, ry + 15, '700 14px ' + FONT_ROUND, '#17211E', 'right');
+  });
+  y += catH + 16;
+
+  // 保護者のチェック
+  rr(X, y, CW, 72, 20, '#E3EBF7');
+  text('保護者のチェック', X + 20, y + 30, '700 15px ' + FONT_ROUND, '#1E3A6B');
+  text('見たよ ' + t.marks[1] + '　注目中 ' + t.marks[2] + '　ストップ ' + t.marks[3] + '　未チェック ' + t.marks[0], X + 20, y + 56, '400 14px ' + FONT_TEXT, '#1E3A6B');
+  y += 88;
+
+  // ひとこと
+  const lines = wrap(c.comment, CW - 40, '400 16px ' + FONT_TEXT);
+  const cmH = 56 + lines.length * 26;
+  rr(X, y, CW, cmH, 20, '#FFFFFF');
+  text('今月のひとこと', X + 20, y + 30, '700 15px ' + FONT_ROUND, '#17211E');
+  lines.forEach((l, i) => text(l, X + 20, y + 58 + i * 26, '400 16px ' + FONT_TEXT, '#17211E'));
+  y += cmH + 16;
+
+  // 承認
+  if (c.status === 'approved') {
+    const pl = c.parentComment ? wrap(c.parentComment, CW - 40, '400 15px ' + FONT_TEXT) : [];
+    const pH = 64 + pl.length * 24;
+    rr(X, y, CW, pH, 20, '#E3F1EC');
+    text('保護者から', X + 20, y + 30, '700 15px ' + FONT_ROUND, '#0E5E4E');
+    text('おこづかい ' + yen(c.allowance), X + CW - 20, y + 30, '700 15px ' + FONT_ROUND, '#0E5E4E', 'right');
+    pl.forEach((l, i) => text(l, X + 20, y + 58 + i * 24, '400 15px ' + FONT_TEXT, '#17211E'));
+    y += pH + 16;
+  }
+
+  const sub = new Date(Number(c.submittedAt));
+  text((sub.getMonth() + 1) + '/' + sub.getDate() + ' に提出' + (c.late ? '（期限後）' : ''), W / 2, y + 12, '400 13px ' + FONT_TEXT, '#55625D', 'center');
+  y += 32;
+
+  const out = document.createElement('canvas');
+  out.width = W * SC;
+  out.height = y * SC;
+  out.getContext('2d').drawImage(work, 0, 0);
+  return out;
+}
+
+function reportFile() {
+  return new File([S.reportBlob], 'okozukai-' + route().id + '.png', { type: 'image/png' });
+}
+
+function downloadReport() {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(S.reportBlob);
+  a.download = reportFile().name;
+  a.click();
 }
 
 // ---------- 操作 ----------
@@ -507,7 +914,23 @@ app.addEventListener('click', async (e) => {
   const el = e.target.closest('[data-act]');
   if (!el) return;
   const act = el.dataset.act;
-  if (act === 'retry') return start();
+  if (act === 'retry') {
+    S.failedMonth = null;
+    return S.user ? render() : start();
+  }
+  if (act === 'recount') {
+    S.closeCash = null;
+    return render();
+  }
+  if (act === 'share' || act === 'download') {
+    if (!S.reportBlob) return toast('画像を作っています。少し待ってください');
+    const file = reportFile();
+    if (act === 'share' && navigator.canShare && navigator.canShare({ files: [file] })) {
+      // 共有メニューから LINE に送ったり、「画像を保存」で写真に残したりできる
+      navigator.share({ files: [file] }).catch(() => {});
+    } else downloadReport();
+    return;
+  }
   if (act === 'month') return load(el.dataset.m);
   if (act === 'type') {
     S.inputType = el.dataset.v;
@@ -526,7 +949,7 @@ app.addEventListener('click', async (e) => {
     const p = S.data.presets.filter((x) => x.id === el.dataset.id)[0];
     el.disabled = true;
     try {
-      await api('add', { type: 'expense', category: p.category, name: p.label, amount: p.amount, date: today(), source: 'preset' });
+      await api('add', { type: 'expense', category: p.category, name: p.label, amount: p.amount, date: inputDate(), source: 'preset' });
       toast(p.label + ' ' + yen(p.amount) + ' を記録しました');
       await load(thisMonth());
     } catch (err) {
@@ -589,6 +1012,40 @@ app.addEventListener('submit', async (e) => {
       toast('修正を保存しました');
       location.hash = '#/history';
       await load();
+    } else if (form.dataset.form === 'cash') {
+      S.closeCash = Math.floor(Number(f.cash.value));
+      render();
+    } else if (form.dataset.form === 'diff') {
+      const m = form.dataset.month;
+      const income = form.dataset.type === 'income';
+      await api('add', {
+        type: form.dataset.type,
+        category: income ? f.category.value : '使途不明',
+        name: income ? '締めの差額（記録漏れの収入）' : '締めの差額',
+        amount: form.dataset.amount,
+        date: lastDay(m),
+        memo: f.reason.value,
+        source: 'diff',
+      });
+      toast('差額を記録しました');
+      await load(m);
+    } else if (form.dataset.form === 'close') {
+      const m = form.dataset.month;
+      await api('close', { month: m, cash: S.closeCash, comment: f.comment.value });
+      S.closeCash = null;
+      toast('提出しました。報告カードを保護者に送りましょう');
+      await load(m);
+      location.hash = '#/report/' + m;
+    } else if (form.dataset.form === 'approve') {
+      const m = form.dataset.month;
+      await api('approve', { month: m, allowance: f.allowance.value, comment: f.comment.value });
+      toast('承認しました');
+      await load(m);
+    } else if (form.dataset.form === 'return') {
+      const m = form.dataset.month;
+      await api('returnClose', { month: m, reason: f.reason.value });
+      toast('差し戻しました');
+      await load(m);
     } else if (form.dataset.form === 'presets') {
       await api('savePresets', { presets: readPresetForm(form) });
       S.presetDraft = null;
@@ -604,10 +1061,20 @@ app.addEventListener('submit', async (e) => {
 });
 
 window.addEventListener('hashchange', () => {
-  if (route().name !== 'presets') S.presetDraft = null;
+  const r = route();
+  if (r.name !== 'presets') S.presetDraft = null;
+  if (r.name === 'archive') S.archive = null; // 開くたびに最新にする
+  if (r.name !== 'close') S.closeCash = null;
   S.filter = 'all';
   render();
   window.scrollTo(0, 0);
+});
+
+// ホーム画面のアプリは開いたまま裏に残るため、戻ってきたら最新の記録を読み直す
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || !S.user || S.loading) return;
+  if (route().name === 'archive') S.archive = null;
+  load();
 });
 
 // iPhone はビューポートの指定だけではピンチ操作の拡大を止められないため

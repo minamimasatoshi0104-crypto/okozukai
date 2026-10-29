@@ -15,6 +15,8 @@ const SHEETS = {
   edits: ['id', 'txId', 'editedAt', 'editor', 'before', 'after', 'reason'],
   presets: ['id', 'label', 'category', 'amount', 'order'],
   meta: ['key', 'value'],
+  // 月末の締め。status は submitted（提出済み）/ approved（承認済み）/ returned（差し戻し）
+  closes: ['month', 'status', 'cash', 'balance', 'comment', 'submittedAt', 'late', 'approvedAt', 'allowance', 'parentComment', 'returnedAt', 'returnReason', 'aiReview'],
 };
 
 const EXPENSE_CATEGORIES = ['食べ物', '遊び', '課金', '買い物', '交通', '貯金', '使途不明', 'その他'];
@@ -69,7 +71,7 @@ function doPost(e) {
 }
 
 // 公開中の版を外から確かめられるよう、更新のたびに上げる
-const VERSION = 3;
+const VERSION = 4;
 
 function doGet() {
   return json_({ ok: true, service: 'okozukai', version: VERSION });
@@ -155,6 +157,10 @@ const ACTIONS = {
         lastParentCheck: getMeta_('lastParentCheck'),
         categories: { expense: EXPENSE_CATEGORIES, income: INCOME_CATEGORIES },
         role: user.role,
+        closes: readAll_('closes'),
+        // 記録を始めた月（それより前の月は締めの対象にしない）
+        firstMonth: all.map((t) => String(t.date).slice(0, 7)).sort()[0] || '',
+        today: today_(),
       };
     },
   },
@@ -162,9 +168,12 @@ const ACTIONS = {
   add: {
     run: (p, user) => {
       const t = validateTx_(p);
+      assertOpen_(t.date);
+      // 締めの差額合わせは、理由を必ず残す
+      if (p.source === 'diff' && !String(t.memo).trim()) throw new Error('reason_required');
       t.id = uid_();
       t.createdAt = Date.now();
-      t.source = p.source === 'preset' ? 'preset' : 'manual';
+      t.source = ['preset', 'diff'].indexOf(p.source) >= 0 ? p.source : 'manual';
       t.receiptUrl = '';
       t.needsCheck = false;
       t.edited = false;
@@ -185,6 +194,8 @@ const ACTIONS = {
       if (!found) throw new Error('not_found');
       const before = found.obj;
       const next = validateTx_(Object.assign({}, before, p.changes || {}));
+      assertOpen_(before.date);
+      assertOpen_(next.date);
       const fields = ['date', 'type', 'category', 'name', 'amount', 'memo', 'voided'];
       const b = {};
       const a = {};
@@ -234,6 +245,120 @@ const ACTIONS = {
     },
   },
 
+  // 本人が月末に手元の現金を数えて提出する
+  close: {
+    role: 'child',
+    run: (p) => {
+      const month = String(p.month || '');
+      if (!/^\d{4}-\d{2}$/.test(month)) throw new Error('bad_month');
+      const today = today_();
+      if (today < lastDay_(month)) throw new Error('not_yet');
+      const existing = findRow_('closes', month, 'month');
+      if (existing && existing.obj.status !== 'returned') throw new Error('already_closed');
+      const comment = String(p.comment || '').trim().slice(0, 100);
+      if (!comment) throw new Error('comment_required');
+
+      let balance = 0;
+      let stops = 0;
+      readAll_('tx').forEach((t) => {
+        const m = String(t.date).slice(0, 7);
+        if (m <= month) balance += signed_(t);
+        if (m === month && Number(t.mark) === 3) stops++;
+      });
+      if (stops) throw new Error('has_stop');
+      const cash = Math.floor(Number(p.cash));
+      if (!(cash >= 0) || cash !== balance) throw new Error('not_matched');
+
+      const row = {
+        month: month,
+        status: 'submitted',
+        cash: cash,
+        balance: balance,
+        comment: comment,
+        submittedAt: Date.now(),
+        late: today > deadline_(month),
+        approvedAt: '',
+        allowance: '',
+        parentComment: '',
+        returnedAt: '',
+        returnReason: '',
+        aiReview: '',
+      };
+      if (existing) writeRow_('closes', existing.row, row);
+      else append_('closes', row);
+      return row;
+    },
+  },
+
+  // 保護者が承認し、おこづかいを収入として記録する
+  approve: {
+    role: 'parent',
+    run: (p) => {
+      const found = findRow_('closes', String(p.month || ''), 'month');
+      if (!found || found.obj.status !== 'submitted') throw new Error('not_submitted');
+      const allowance = Math.floor(Number(p.allowance));
+      if (!(allowance >= 0 && allowance <= 100000)) throw new Error('bad_allowance');
+      const now = Date.now();
+      if (allowance > 0) {
+        // 締めた月の残高を変えないよう、早くても翌月1日の日付で記録する
+        const nextFirst = shiftMonth_(found.obj.month, 1) + '-01';
+        append_('tx', {
+          id: uid_(), createdAt: now, date: today_() < nextFirst ? nextFirst : today_(), type: 'income', category: 'おこづかい',
+          name: Number(found.obj.month.slice(5)) + '月分のおこづかい', amount: allowance, memo: '', receiptUrl: '',
+          source: 'allowance', needsCheck: false, edited: false, voided: false, mark: 0, markedAt: '', markedBy: '',
+        });
+      }
+      const row = Object.assign({}, found.obj, { status: 'approved', approvedAt: now, allowance: allowance, parentComment: String(p.comment || '').trim().slice(0, 200) });
+      writeRow_('closes', found.row, row);
+      return row;
+    },
+  },
+
+  // 保護者が差し戻すと、本人がもう一度締め直せる
+  returnClose: {
+    role: 'parent',
+    run: (p) => {
+      const found = findRow_('closes', String(p.month || ''), 'month');
+      if (!found || found.obj.status !== 'submitted') throw new Error('not_submitted');
+      const reason = String(p.reason || '').trim().slice(0, 200);
+      if (!reason) throw new Error('reason_required');
+      const row = Object.assign({}, found.obj, { status: 'returned', returnedAt: Date.now(), returnReason: reason });
+      writeRow_('closes', found.row, row);
+      return row;
+    },
+  },
+
+  // 振り返り：記録のある最初の月から今月までの集計
+  archive: {
+    run: () => {
+      const all = readAll_('tx');
+      const closes = readAll_('closes');
+      const byMonth = {};
+      all.forEach((t) => {
+        const m = String(t.date).slice(0, 7);
+        const s = byMonth[m] || (byMonth[m] = { income: 0, expense: 0, unknown: 0, net: 0 });
+        if (t.voided) return;
+        if (t.type === 'income') s.income += Number(t.amount);
+        else {
+          s.expense += Number(t.amount);
+          if (t.category === '使途不明') s.unknown += Number(t.amount);
+        }
+        s.net += signed_(t);
+      });
+      const months = Object.keys(byMonth).sort();
+      if (!months.length) return { months: [], today: today_() };
+      const current = today_().slice(0, 7);
+      const list = [];
+      let balance = 0;
+      for (let m = months[0]; m <= current; m = shiftMonth_(m, 1)) {
+        const s = byMonth[m] || { income: 0, expense: 0, unknown: 0, net: 0 };
+        balance += s.net;
+        list.push({ month: m, income: s.income, expense: s.expense, unknown: s.unknown, balance: balance, close: closes.filter((c) => c.month === m)[0] || null });
+      }
+      return { months: list.reverse(), today: today_() };
+    },
+  },
+
   savePresets: {
     run: (p) => {
       const list = (p.presets || []).slice(0, 20).map((x, i) => ({
@@ -250,6 +375,37 @@ const ACTIONS = {
     },
   },
 };
+
+// ---- 締めの期間 ----
+
+function today_() {
+  return Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd');
+}
+
+// その月の末日（YYYY-MM-DD）
+function lastDay_(month) {
+  const y = Number(month.slice(0, 4));
+  const m = Number(month.slice(5, 7));
+  return month + '-' + String(new Date(y, m, 0).getDate()).padStart(2, '0');
+}
+
+// 締めの期限（翌月3日）
+function deadline_(month) {
+  return shiftMonth_(month, 1) + '-03';
+}
+
+function shiftMonth_(month, d) {
+  const y = Number(month.slice(0, 4));
+  const m = Number(month.slice(5, 7)) - 1 + d;
+  return (y + Math.floor(m / 12)) + '-' + String((m % 12 + 12) % 12 + 1).padStart(2, '0');
+}
+
+// 提出済み・承認済みの月は、差し戻されるまで記録を変えられない
+function assertOpen_(date) {
+  const month = String(date).slice(0, 7);
+  const c = readAll_('closes').filter((x) => x.month === month)[0];
+  if (c && c.status !== 'returned') throw new Error('month_locked');
+}
 
 // ---- 検証 ----
 
@@ -288,8 +444,14 @@ function signed_(t) {
 // ---- シート操作 ----
 
 function sheet_(name) {
-  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
-  if (!sh) throw new Error('setup_required');
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(name);
+  if (!sh) {
+    // 後から増えたシートは、初めて使うときに作る
+    sh = ss.insertSheet(name);
+    sh.appendRow(SHEETS[name]);
+    sh.setFrozenRows(1);
+  }
   return sh;
 }
 
@@ -302,20 +464,21 @@ function readAll_(name) {
   return sh.getRange(2, 1, last - 1, cols.length).getDisplayValues().map((r) => {
     const o = {};
     cols.forEach((c, i) => (o[c] = r[i]));
-    ['amount', 'createdAt', 'mark', 'order', 'editedAt', 'markedAt'].forEach((k) => {
+    ['amount', 'createdAt', 'mark', 'order', 'editedAt', 'markedAt', 'cash', 'balance', 'submittedAt', 'approvedAt', 'allowance', 'returnedAt'].forEach((k) => {
       if (k in o && o[k] !== '') o[k] = Number(o[k]);
     });
-    ['needsCheck', 'edited', 'voided'].forEach((k) => {
+    ['needsCheck', 'edited', 'voided', 'late'].forEach((k) => {
       if (k in o) o[k] = o[k] === 'TRUE';
     });
     return o;
   });
 }
 
-function findRow_(name, id) {
+function findRow_(name, id, key) {
+  const k = key || 'id';
   const all = readAll_(name);
   for (let i = 0; i < all.length; i++) {
-    if (all[i].id === id) return { row: i + 2, obj: all[i] };
+    if (all[i][k] === id) return { row: i + 2, obj: all[i] };
   }
   return null;
 }
