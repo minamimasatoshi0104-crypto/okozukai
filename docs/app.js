@@ -24,6 +24,8 @@ const S = {
   archive: null,
   closeCash: null,
   reportBlob: null,
+  receiptDraft: null,
+  reading: false,
 };
 
 const app = document.getElementById('app');
@@ -89,6 +91,7 @@ const ICON = {
   back: '<path d="m15 5-7 7 7 7"/>',
   chart: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
   flag: '<path d="M5 21V4h11l-1.5 4L16 12H5"/>',
+  camera: '<path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/>',
 };
 function icon(name, size) {
   const s = size || 24;
@@ -204,6 +207,7 @@ const ERRORS = {
   comment_required: '今月のひとことを書いてください',
   not_submitted: 'この月の報告は、承認や差し戻しができる状態ではありません',
   bad_allowance: 'おこづかいの金額を正しく入れてください',
+  bad_image: '写真を読み込めませんでした。もう一度撮ってください',
 };
 function fail(err) {
   toast(ERRORS[err.message] || '通信に失敗しました。もう一度試してください');
@@ -367,6 +371,7 @@ function itemRow(t, opts) {
     (t.voided ? '<span class="pill plain">取り消し</span>' : '') +
     (t.edited ? '<span class="pill edited">修正あり</span>' : '') +
     (t.needsCheck ? '<span class="pill need">要確認</span>' : '') +
+    (t.source === 'receipt' ? '<span class="pill plain">レシート</span>' : '') +
     markPill(t.mark || 0);
   const inner =
     '<span class="date">' + md(t.date) + '</span>' +
@@ -445,22 +450,32 @@ function closeBanners() {
 
 function viewInput() {
   const d = S.data;
+  const r = S.receiptDraft;
+  if (r) S.inputType = 'expense';
   const cats = S.inputType === 'income' ? d.categories.income : d.categories.expense;
   if (cats.indexOf(S.inputCat) < 0) S.inputCat = cats[0];
+  // レシートの日付が読めない・未来・締めた月のときは、ふだんの日付にする
+  const rDate = r && r.date && r.date <= today() && !isLocked(r.date.slice(0, 7)) ? r.date : inputDate();
   return (
     '<main class="main"><h1>記録する</h1>' +
     '<div class="seg"><button data-act="type" data-v="expense" aria-pressed="' + (S.inputType === 'expense') + '">使った（支出）</button><button data-act="type" data-v="income" aria-pressed="' + (S.inputType === 'income') + '">もらった（収入）</button></div>' +
     (S.inputType === 'expense'
+      ? '<label class="btn ghost block" style="min-height:56px"' + (S.reading ? ' aria-disabled="true"' : '') + '>' + icon('camera') + (S.reading ? 'AI が読み取り中…' : 'レシートを撮って記録') +
+        '<input type="file" accept="image/*" capture="environment" data-receipt class="visually-hidden"' + (S.reading ? ' disabled' : '') + '></label>'
+      : '') +
+    (S.inputType === 'expense' && !r
       ? '<section style="display:flex;flex-direction:column;gap:10px"><div class="spread"><h2 style="margin:0;font-size:15px">ワンタップで記録</h2><a href="#/presets" style="font-size:13px;font-weight:700;text-decoration:none">ボタンを編集</a></div>' +
         '<div class="presets">' + d.presets.map((p) => '<button class="preset" data-act="preset" data-id="' + h(p.id) + '"><strong>' + h(p.label) + '</strong><span>' + h(p.category) + ' ・ ' + yen(p.amount) + '</span></button>').join('') + '</div></section>'
       : '') +
-    '<form class="card" data-form="add"><h2>手で入力</h2>' +
-    '<label class="field">金額<input name="amount" type="number" inputmode="numeric" min="1" placeholder="0" required></label>' +
+    '<form class="card" data-form="add"><h2>' + (r ? 'レシートの内容を確かめて記録' : '手で入力') + '</h2>' +
+    (r ? '<div class="notice">' + (r.aiFailed ? 'AI が読み取れませんでした。写真は保存したので、内容を手で入れてください。' : 'AI が読み取った内容です。レシートと見比べて、違うところは直してから記録してください。') + '</div>' : '') +
+    '<label class="field">金額<input name="amount" type="number" inputmode="numeric" min="1" placeholder="0" required' + (r && r.amount ? ' value="' + r.amount + '"' : '') + '></label>' +
     '<div class="chips">' + cats.map((c) => '<button type="button" class="cat" data-act="cat" data-v="' + h(c) + '" aria-pressed="' + (c === S.inputCat) + '">' + h(c) + '</button>').join('') + '</div>' +
-    '<label class="field">内容（お店・買ったもの）<input name="name" type="text" maxlength="50" placeholder="例：ローソンでおにぎり"></label>' +
-    '<label class="field">日付<input name="date" type="date" value="' + inputDate() + '" max="' + inputDate() + '" required></label>' +
+    '<label class="field">内容（お店・買ったもの）<input name="name" type="text" maxlength="50" placeholder="例：ローソンでおにぎり"' + (r ? ' value="' + h(r.store) + '"' : '') + '></label>' +
+    '<label class="field">日付<input name="date" type="date" value="' + (r ? rDate : inputDate()) + '" max="' + (r ? (rDate > inputDate() ? rDate : inputDate()) : inputDate()) + '" required></label>' +
     (isLocked(thisMonth()) ? '<div class="notice">今月は締めて提出済みです。今日使ったお金は、来月1日の日付で記録します。</div>' : '') +
-    '<button class="btn block" type="submit">記録する</button></form>' +
+    '<button class="btn block" type="submit">記録する</button>' +
+    (r ? '<button class="btn ghost block" type="button" data-act="receiptCancel">やめる</button>' : '') + '</form>' +
     '</main>'
   );
 }
@@ -491,7 +506,8 @@ function viewEdit(id) {
   return (
     '<main class="main"><div class="row"><a class="back" href="#/history" aria-label="履歴に戻る">' + icon('back') + '</a><h1 style="font-size:20px">記録を修正</h1></div>' +
     '<section class="card"><span class="muted small">いまの記録</span><div class="spread"><span>' + md(t.date) + ' ' + h(t.name || t.category) + ' ・ ' + h(t.category) + '</span><strong>' + yen(t.amount) + '</strong></div>' +
-    (t.mark ? '<div>' + markPill(t.mark) + '</div>' : '') + '</section>' +
+    (t.mark ? '<div>' + markPill(t.mark) + '</div>' : '') +
+    (t.receiptUrl && S.user.role === 'parent' ? '<a href="' + h(t.receiptUrl) + '" target="_blank" rel="noopener">レシートの写真を見る</a>' : '') + '</section>' +
     (isLocked(t.date.slice(0, 7))
       ? '<div class="notice">この月は締めて提出済みのため、修正できません。直したいときは、保護者に差し戻してもらってください。</div>'
       : editForm(t, cats)) +
@@ -625,6 +641,26 @@ function viewClose(m) {
   return '<main class="main">' + head + body + '</main>';
 }
 
+function aiReview(c) {
+  try {
+    const r = c && c.aiReview ? JSON.parse(c.aiReview) : null;
+    return r && r.good ? r : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function aiReviewCard(c) {
+  const r = aiReview(c);
+  if (!r) return '';
+  return (
+    '<section class="card" style="gap:8px"><h2>AI コーチから</h2>' +
+    '<div class="small"><strong>よかった点</strong>　' + h(r.good) + '</div>' +
+    '<div class="small"><strong>気をつけたい点</strong>　' + h(r.care) + '</div>' +
+    '<div class="small"><strong>来月の目標</strong>　' + h(r.goal) + '</div></section>'
+  );
+}
+
 function viewReport(m) {
   const c = closeOf(m);
   const back = '<div class="row"><a class="back" href="#/archive" aria-label="振り返りに戻る">' + icon('back') + '</a><h1 style="font-size:20px">' + monthLabel(m) + 'の報告</h1></div>';
@@ -636,6 +672,7 @@ function viewReport(m) {
     '<div class="row">' + closePill(state) + (c.late ? '<span class="pill stop">期限後に提出</span>' : '') + '</div>' +
     '<img id="report-img" class="report-img" alt="' + monthLabel(m) + 'の報告カード">' +
     '<div class="presets"><button class="btn" data-act="share">' + (parent ? '共有・保存' : 'LINEで送る・保存') + '</button><button class="btn ghost" data-act="download">画像をダウンロード</button></div>' +
+    aiReviewCard(c) +
     (parent && c.status === 'submitted'
       ? '<form class="card" data-form="approve" data-month="' + m + '"><h2>承認する</h2>' +
         '<label class="field">渡すおこづかい（円）<input name="allowance" type="number" inputmode="numeric" min="0" value="3000" required></label>' +
@@ -674,6 +711,7 @@ function viewArchive() {
       '<div class="spread small"><span>支出 <strong>' + yen(x.expense) + '</strong></span><span>月末残高 <strong>' + yen(x.balance) + '</strong></span><span style="color:' + (x.unknown ? 'var(--warn)' : 'var(--sub)') + '">使途不明 <strong>' + yen(x.unknown) + '</strong></span></div>' +
       (c && c.comment ? '<div class="small">本人：' + h(c.comment) + '</div>' : '') +
       (c && c.parentComment ? '<div class="small" style="color:var(--parent)">保護者：' + h(c.parentComment) + '</div>' : '') +
+      (aiReview(c) ? '<div class="small muted">AI コーチ：' + h(aiReview(c).goal) + '</div>' : '') +
       (c && c.status === 'approved' ? '<div class="small muted">おこづかい ' + yen(c.allowance) + '</div>' : '') +
       '</a>'
     );
@@ -754,7 +792,8 @@ async function fillReport(m) {
   const d = S.data;
   S.reportBlob = null;
   // 画像に描く文字のフォントを先に読み込む（日本語フォントは文字ごとに分かれて配信されるため）
-  const sample = monthLabel(m) + 'おこづかい報告月末の残高繰越収入支出手元の現金使途不明何に使った保護者のチェック見たよ注目中ストップ未チェック今月のひとこと保護者からありなしぴったり承認待ち済み期限後に提出¥0123456789,+−' + c.comment + (c.parentComment || '') + Object.keys(totals(d).byCat).join('');
+  const ai = aiReview(c);
+  const sample = (ai ? 'AIコーチからよかった点気をつけたい点来月の目標' + ai.good + ai.care + ai.goal : '') + monthLabel(m) + 'おこづかい報告月末の残高繰越収入支出手元の現金使途不明何に使った保護者のチェック見たよ注目中ストップ未チェック今月のひとこと保護者からありなしぴったり承認待ち済み期限後に提出¥0123456789,+−' + c.comment + (c.parentComment || '') + Object.keys(totals(d).byCat).join('');
   if (document.fonts) {
     await Promise.all(['800 30px', '700 16px', '400 14px'].map((w, i) => document.fonts.load(w + ' ' + (i < 2 ? FONT_ROUND : FONT_TEXT), sample).catch(() => {})));
   }
@@ -866,6 +905,26 @@ function drawReport(m, d, c) {
   lines.forEach((l, i) => text(l, X + 20, y + 58 + i * 26, '400 16px ' + FONT_TEXT, '#17211E'));
   y += cmH + 16;
 
+  // AI コーチ
+  const ai = aiReview(c);
+  if (ai) {
+    const parts = [['よかった点', ai.good], ['気をつけたい点', ai.care], ['来月の目標', ai.goal]].map((x) => [x[0], wrap(x[1], CW - 40, '400 15px ' + FONT_TEXT)]);
+    const aiH = 50 + parts.reduce((n, x) => n + 24 + x[1].length * 22, 0);
+    rr(X, y, CW, aiH, 20, '#FFFFFF');
+    text('AI コーチから', X + 20, y + 30, '700 15px ' + FONT_ROUND, '#17211E');
+    let ay = y + 56;
+    parts.forEach((x) => {
+      text(x[0], X + 20, ay, '700 13px ' + FONT_ROUND, '#0E5E4E');
+      ay += 22;
+      x[1].forEach((l) => {
+        text(l, X + 20, ay, '400 15px ' + FONT_TEXT, '#17211E');
+        ay += 22;
+      });
+      ay += 2;
+    });
+    y += aiH + 16;
+  }
+
   // 承認
   if (c.status === 'approved') {
     const pl = c.parentComment ? wrap(c.parentComment, CW - 40, '400 15px ' + FONT_TEXT) : [];
@@ -917,6 +976,10 @@ app.addEventListener('click', async (e) => {
   if (act === 'retry') {
     S.failedMonth = null;
     return S.user ? render() : start();
+  }
+  if (act === 'receiptCancel') {
+    S.receiptDraft = null;
+    return render();
   }
   if (act === 'recount') {
     S.closeCash = null;
@@ -990,6 +1053,40 @@ app.addEventListener('click', async (e) => {
   }
 });
 
+// 写真は縮小して JPEG にしてから送る（通信量と AI の費用を抑える）
+function shrinkImage(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, 1600 / Math.max(img.width, img.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width * scale);
+      c.height = Math.round(img.height * scale);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(img.src);
+      resolve(c.toDataURL('image/jpeg', 0.8).split(',')[1]);
+    };
+    img.onerror = () => reject(new Error('bad_image'));
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+app.addEventListener('change', async (e) => {
+  if (!e.target.matches || !e.target.matches('[data-receipt]') || !e.target.files.length) return;
+  S.reading = true;
+  render();
+  try {
+    const image = await shrinkImage(e.target.files[0]);
+    S.receiptDraft = await api('readReceipt', { image: image });
+    S.inputCat = S.receiptDraft.category;
+  } catch (err) {
+    fail(err);
+  } finally {
+    S.reading = false;
+    render();
+  }
+});
+
 app.addEventListener('submit', async (e) => {
   const form = e.target.closest('[data-form]');
   if (!form) return;
@@ -999,7 +1096,13 @@ app.addEventListener('submit', async (e) => {
   const f = form.elements;
   try {
     if (form.dataset.form === 'add') {
-      await api('add', { type: S.inputType, category: S.inputCat, name: f.name.value, amount: f.amount.value, date: f.date.value });
+      const r = S.receiptDraft;
+      await api('add', Object.assign(
+        { type: S.inputType, category: S.inputCat, name: f.name.value, amount: f.amount.value, date: f.date.value },
+        // 読み取れなかった項目があれば、本人が直していても保護者に確かめてもらう
+        r ? { source: 'receipt', receiptId: r.receiptId, needsCheck: !!(r.unclear || r.aiFailed) } : {}
+      ));
+      S.receiptDraft = null;
       toast(yen(f.amount.value) + ' を記録しました');
       form.reset();
       await load(f.date.value.slice(0, 7));
@@ -1065,6 +1168,7 @@ window.addEventListener('hashchange', () => {
   if (r.name !== 'presets') S.presetDraft = null;
   if (r.name === 'archive') S.archive = null; // 開くたびに最新にする
   if (r.name !== 'close') S.closeCash = null;
+  if (r.name !== 'input') S.receiptDraft = null;
   S.filter = 'all';
   render();
   window.scrollTo(0, 0);

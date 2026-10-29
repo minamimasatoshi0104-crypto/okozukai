@@ -120,3 +120,7 @@ label.field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; 
 .banner.parent { background: var(--parent-soft); color: #1E3A6B; }
 .pill.ok { background: var(--accent-soft); color: var(--accent); }
 .report-img { width: 100%; border-radius: 16px; background: var(--soft); min-height: 240px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+
+/* iPhone では display:none のファイル選択欄がラベルから開かないことがあるため、見えなくするだけにする */
+.visually-hidden { position: absolute; width: 1px; height: 1px; opacity: 0; overflow: hidden; }
+label.btn { position: relative; }

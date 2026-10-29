@@ -5,6 +5,7 @@
  *   GOOGLE_CLIENT_ID  … Google ログイン用 OAuth クライアント ID
  *   PARENT_EMAILS     … 保護者の Google アカウント（カンマ区切り）
  *   CHILD_EMAILS      … 子どもの Google アカウント（カンマ区切り）
+ *   ANTHROPIC_API_KEY … レシートの読み取りと AI コーチに使う Claude の API キー
  *
  * 初回は setup() を一度実行してシートを作成する。
  */
@@ -71,7 +72,7 @@ function doPost(e) {
 }
 
 // 公開中の版を外から確かめられるよう、更新のたびに上げる
-const VERSION = 4;
+const VERSION = 5;
 
 function doGet() {
   return json_({ ok: true, service: 'okozukai', version: VERSION });
@@ -173,9 +174,11 @@ const ACTIONS = {
       if (p.source === 'diff' && !String(t.memo).trim()) throw new Error('reason_required');
       t.id = uid_();
       t.createdAt = Date.now();
-      t.source = ['preset', 'diff'].indexOf(p.source) >= 0 ? p.source : 'manual';
-      t.receiptUrl = '';
-      t.needsCheck = false;
+      t.source = ['preset', 'diff', 'receipt'].indexOf(p.source) >= 0 ? p.source : 'manual';
+      // レシートの写真は readReceipt で保存したドライブのファイル ID を受け取る
+      t.receiptUrl = /^[\w-]{10,}$/.test(String(p.receiptId || '')) ? 'https://drive.google.com/file/d/' + p.receiptId + '/view' : '';
+      // AI が読み取れなかった項目がある記録は、保護者に分かるよう「要確認」にする
+      t.needsCheck = t.source === 'receipt' && p.needsCheck === true;
       t.edited = false;
       t.voided = false;
       t.mark = 0;
@@ -284,6 +287,12 @@ const ACTIONS = {
         returnReason: '',
         aiReview: '',
       };
+      // AI が失敗しても提出は通す（レビューなしになるだけ）
+      try {
+        row.aiReview = JSON.stringify(coachReview_(month, comment));
+      } catch (err) {
+        console.warn('coachReview failed: ' + err.message);
+      }
       if (existing) writeRow_('closes', existing.row, row);
       else append_('closes', row);
       return row;
@@ -310,6 +319,7 @@ const ACTIONS = {
       }
       const row = Object.assign({}, found.obj, { status: 'approved', approvedAt: now, allowance: allowance, parentComment: String(p.comment || '').trim().slice(0, 200) });
       writeRow_('closes', found.row, row);
+      trashReceipts_(found.obj.month);
       return row;
     },
   },
@@ -359,6 +369,24 @@ const ACTIONS = {
     },
   },
 
+  // レシートの写真をドライブに保存し、AI で金額・店名・分類・日付を読み取る
+  readReceipt: {
+    role: 'child',
+    run: (p) => {
+      const image = String(p.image || '');
+      if (!image || image.length > 4000000) throw new Error('bad_image');
+      const file = receiptFolder_().createFile(Utilities.newBlob(Utilities.base64Decode(image), 'image/jpeg', 'receipt-' + today_() + '-' + uid_() + '.jpg'));
+      const result = { receiptId: file.getId(), amount: 0, store: '', category: 'その他', date: '', unclear: true };
+      try {
+        Object.assign(result, readReceipt_(image));
+      } catch (err) {
+        console.warn('readReceipt failed: ' + err.message);
+        result.aiFailed = true;
+      }
+      return result;
+    },
+  },
+
   savePresets: {
     run: (p) => {
       const list = (p.presets || []).slice(0, 20).map((x, i) => ({
@@ -375,6 +403,129 @@ const ACTIONS = {
     },
   },
 };
+
+// ---- AI（Claude） ----
+
+const CLAUDE_MODEL = 'claude-haiku-5-5';
+
+// 構造化出力で JSON を返させ、パースして返す
+function callClaude_(system, content, schema) {
+  const key = (PropertiesService.getScriptProperties().getProperty('ANTHROPIC_API_KEY') || '').trim();
+  if (!key) throw new Error('no_api_key');
+  const res = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'x-api-key': key, 'anthropic-version': '2026-10-21' },
+    payload: JSON.stringify({
+      model: CLAUDE_MODEL,
+      max_tokens: 4096,
+      system: system,
+      output_config: { effort: 'low', format: { type: 'json_schema', schema: schema } },
+      messages: [{ role: 'user', content: content }],
+    }),
+    muteHttpExceptions: true,
+  });
+  if (res.getResponseCode() !== 200) throw new Error('claude_http_' + res.getResponseCode() + ' ' + res.getContentText().slice(0, 300));
+  const msg = JSON.parse(res.getContentText());
+  if (msg.stop_reason !== 'end_turn') throw new Error('claude_stop_' + msg.stop_reason);
+  // 思考のブロックが先に来ることがあるので、テキストだけを取り出す
+  const text = msg.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
+  return JSON.parse(text);
+}
+
+function readReceipt_(imageBase64) {
+  const out = callClaude_(
+    'あなたは日本のレシートを読み取る係です。中学生のおこづかい帳に記録するため、合計金額・店名・日付・分類を取り出します。' +
+      '読み取れない項目は amount を 0、文字列を空にし、unclear を true にしてください。金額は税込の合計（お預かりやお釣りではない）です。',
+    [
+      { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: imageBase64 } },
+      { type: 'text', text: '分類は次から選んでください：' + EXPENSE_CATEGORIES.filter((c) => c !== '使途不明').join('、') + '。食べ物・飲み物は「食べ物」、ゲームの課金やプリペイドカードは「課金」です。' },
+    ],
+    {
+      type: 'object',
+      properties: {
+        amount: { type: 'integer', description: '税込の合計金額（円）。読めなければ 0' },
+        store: { type: 'string', description: '店名。読めなければ空' },
+        date: { type: 'string', description: 'YYYY-MM-DD。読めなければ空' },
+        category: { type: 'string', enum: EXPENSE_CATEGORIES.filter((c) => c !== '使途不明') },
+        unclear: { type: 'boolean', description: 'どれかの項目に自信がないとき true' },
+      },
+      required: ['amount', 'store', 'date', 'category', 'unclear'],
+      additionalProperties: false,
+    }
+  );
+  return {
+    amount: Math.max(0, Math.floor(Number(out.amount) || 0)),
+    store: String(out.store || '').slice(0, 50),
+    date: /^\d{4}-\d{2}-\d{2}$/.test(out.date) ? out.date : '',
+    category: EXPENSE_CATEGORIES.indexOf(out.category) >= 0 ? out.category : 'その他',
+    unclear: out.unclear === true || !out.amount,
+  };
+}
+
+// 締めの提出時に、応援するコーチとして3行のレビューを作る。名前やメールアドレスは送らない
+function coachReview_(month, comment) {
+  let opening = 0;
+  const rows = [];
+  readAll_('tx').forEach((t) => {
+    const m = String(t.date).slice(0, 7);
+    if (m < month) opening += signed_(t);
+    else if (m === month && !t.voided) rows.push(t);
+  });
+  const lines = rows.map((t) => [t.date.slice(5), t.type === 'income' ? '収入' : '支出', t.category, t.name, t.amount + '円'].join(' '));
+  return callClaude_(
+    'あなたは中学生のおこづかい管理を応援するコーチです。叱らず、具体的に、前向きに話します。' +
+      'この子は以前お金の使い方で失敗し、いまは親と一緒に記録を続ける練習をしています。記録を続けられたこと自体を認めてください。' +
+      '「使途不明」が多い月は責めずに、次は記録できるような小さな工夫を提案してください。各項目は中学生に伝わる言葉で、40文字以内の1文にします。',
+    [{ type: 'text', text: month + 'のおこづかい帳です。\n月初の残高：' + opening + '円\n本人のひとこと：' + comment + '\n記録：\n' + (lines.join('\n') || '（記録なし）') }],
+    {
+      type: 'object',
+      properties: {
+        good: { type: 'string', description: 'よかった点' },
+        care: { type: 'string', description: '気をつけたい点' },
+        goal: { type: 'string', description: '来月のひとこと目標' },
+      },
+      required: ['good', 'care', 'goal'],
+      additionalProperties: false,
+    }
+  );
+}
+
+// ---- レシートの写真（ドライブ） ----
+
+function receiptFolder_() {
+  const id = getMeta_('receiptFolderId');
+  if (id) {
+    try {
+      return DriveApp.getFolderById(String(id));
+    } catch (err) {
+      // フォルダが消されていたら作り直す
+    }
+  }
+  const folder = DriveApp.createFolder('おこづかい帳レシート');
+  setMeta_('receiptFolderId', folder.getId());
+  return folder;
+}
+
+// 承認した月のレシートの写真をゴミ箱に移す（30日間は戻せる）
+function trashReceipts_(month) {
+  readAll_('tx').forEach((t, i) => {
+    if (String(t.date).slice(0, 7) !== month || !t.receiptUrl) return;
+    const m = String(t.receiptUrl).match(/\/d\/([\w-]+)/);
+    try {
+      if (m) DriveApp.getFileById(m[1]).setTrashed(true);
+      writeRow_('tx', i + 2, Object.assign({}, t, { receiptUrl: '' }));
+    } catch (err) {
+      console.warn('trash failed: ' + err.message);
+    }
+  });
+}
+
+// エディタから一度実行して、ドライブと外部接続の権限を許可するための関数
+function authorize() {
+  receiptFolder_();
+  UrlFetchApp.fetch('https://api.anthropic.com', { muteHttpExceptions: true });
+}
 
 // ---- 締めの期間 ----
 
