@@ -8,6 +8,7 @@
  *   ANTHROPIC_API_KEY … レシートの読み取りと AI コーチに使う Claude の API キー
  *
  * 初回は setup() を一度実行してシートを作成する。
+ * 通知を使うときは setupNotify() を一度実行する（カレンダーの作成・共有と、毎日の実行の登録）。
  */
 
 const SHEETS = {
@@ -75,7 +76,7 @@ function doPost(e) {
 }
 
 // 公開中の版を外から確かめられるよう、更新のたびに上げる
-const VERSION = 6;
+const VERSION = 7;
 
 function doGet() {
   return json_({ ok: true, service: 'okozukai', version: VERSION });
@@ -189,6 +190,8 @@ const ACTIONS = {
       t.markedBy = '';
       t.createdBy = user.actingParent ? 'parent' : 'child';
       append_('tx', t);
+      // 記録したら、その日の「記録をつけよう」の通知は不要になる
+      if (!user.actingParent) notifySafe_(() => clearEvents_(childCalendar_(), 'record'));
       return t;
     },
   },
@@ -232,6 +235,7 @@ const ACTIONS = {
       const now = Date.now();
       writeRow_('tx', found.row, Object.assign({}, found.obj, { mark: state, markedAt: state ? now : '', markedBy: state ? user.email : '' }));
       setMeta_('lastParentCheck', now);
+      if (!uncheckedCount_()) notifySafe_(() => clearEvents_(CalendarApp.getDefaultCalendar(), 'unchecked'));
       return { id: p.id, mark: state };
     },
   },
@@ -248,6 +252,7 @@ const ACTIONS = {
         }
       });
       setMeta_('lastParentCheck', now);
+      if (!uncheckedCount_()) notifySafe_(() => clearEvents_(CalendarApp.getDefaultCalendar(), 'unchecked'));
       return { count: count };
     },
   },
@@ -299,6 +304,16 @@ const ACTIONS = {
       }
       if (existing) writeRow_('closes', existing.row, row);
       else append_('closes', row);
+      notifySafe_(() => {
+        clearEvents_(childCalendar_(), 'close');
+        let unknown = 0;
+        readAll_('tx').forEach((t) => {
+          if (String(t.date).slice(0, 7) === month && !t.voided && t.type === 'expense' && t.category === '使途不明') unknown += Number(t.amount);
+        });
+        const start = new Date(Date.now() + 60 * 1000);
+        parentEvent_('submitted', Number(month.slice(5)) + '月の締めが提出されました', start,
+          'ひとこと：' + comment + '\n残高：' + balance.toLocaleString() + '円\n使途不明：' + unknown.toLocaleString() + '円' + (row.late ? '\n（期限後の提出）' : ''));
+      });
       return row;
     },
   },
@@ -532,6 +547,154 @@ function trashReceipts_(month) {
 function authorize() {
   receiptFolder_();
   UrlFetchApp.fetch('https://api.anthropic.com', { muteHttpExceptions: true });
+}
+
+// ---- 通知（Google カレンダー） ----
+// 本人には共有カレンダー「おこづかい帳」、保護者には保護者のいつものカレンダーに、必要なときだけ予定を入れる。
+// 作った予定にはタグ okozukai=<種類> を付け、消すときはタグで見分ける（保護者の他の予定には触らない）
+
+const APP_URL = 'https://minamimasatoshi0104-crypto.github.io/okozukai/';
+const EVENT_TAG = 'okozukai';
+
+// エディタから一度実行する。何度実行しても同じ状態になる
+function setupNotify() {
+  let cal = childCalendar_();
+  if (!cal) {
+    cal = CalendarApp.createCalendar('おこづかい帳', { timeZone: 'Asia/Tokyo' });
+    setMeta_('notifyCalendarId', cal.getId());
+  }
+  emails_('CHILD_EMAILS').forEach((email) => {
+    Calendar.Acl.insert({ role: 'reader', scope: { type: 'user', value: email } }, cal.getId());
+  });
+  const handlers = ['remindChild', 'remindParent', 'alertOverdue'];
+  ScriptApp.getProjectTriggers().forEach((t) => {
+    if (handlers.indexOf(t.getHandlerFunction()) >= 0) ScriptApp.deleteTrigger(t);
+  });
+  // atHour は指定した時刻の前後15分くらいのどこかで動くので、予定の時刻より前の時間帯にする
+  ScriptApp.newTrigger('remindChild').timeBased().atHour(19).nearMinute(0).everyDays(1).create();
+  ScriptApp.newTrigger('remindParent').timeBased().atHour(20).nearMinute(0).everyDays(1).create();
+  ScriptApp.newTrigger('alertOverdue').timeBased().atHour(7).nearMinute(0).everyDays(1).create();
+}
+
+// 毎日19時台：本人に20時の予定を入れる。締めの期間で未提出なら締め、そうでなければ今日の記録がないときだけ記録
+function remindChild() {
+  const cal = childCalendar_();
+  if (!cal) return;
+  cleanupEvents_();
+  const today = today_();
+  const at = timeOf_(today, 20);
+  const pending = pendingCloses_();
+  if (pending.length) {
+    const m = pending[0];
+    childEvent_(cal, 'close', Number(m.slice(5)) + '月の締めをしよう', at,
+      '手元のお金を数えて、アプリで締めを提出しよう（期限は' + Number(deadline_(m).slice(5, 7)) + '月3日）');
+    return;
+  }
+  const recorded = readAll_('tx').some((t) => t.createdBy !== 'parent' && t.source !== 'allowance' && t.createdAt && Utilities.formatDate(new Date(t.createdAt), 'Asia/Tokyo', 'yyyy-MM-dd') === today);
+  if (!recorded) childEvent_(cal, 'record', '今日の記録をつけよう', at, '使ったお金・もらったお金を記録しよう');
+}
+
+// 毎日20時台：未チェックの明細があれば、保護者に21時の予定を入れる
+function remindParent() {
+  const n = uncheckedCount_();
+  if (n) parentEvent_('unchecked', '未チェック ' + n + '件', timeOf_(today_(), 21), 'アプリで明細を確認してください');
+}
+
+// 毎日7時台：4日に前の月が未提出なら、保護者に8時のアラートを入れる
+function alertOverdue() {
+  const today = today_();
+  if (today.slice(8) !== '04') return;
+  const month = shiftMonth_(today.slice(0, 7), -1);
+  if (!isTracked_(month)) return;
+  const c = readAll_('closes').filter((x) => x.month === month)[0];
+  if (c && c.status !== 'returned') return;
+  parentEvent_('overdue', Number(month.slice(5)) + '月の締めが未提出（要相談）', timeOf_(today, 8), '期限の3日までに締めが提出されませんでした');
+}
+
+// 締めの期間（月末日〜翌月3日）で未提出の月と、差し戻されたままの月
+function pendingCloses_() {
+  const today = today_();
+  const month = today.slice(0, 7);
+  const closes = readAll_('closes');
+  const open = (m) => {
+    const c = closes.filter((x) => x.month === m)[0];
+    return !c || c.status === 'returned';
+  };
+  const list = [];
+  if (today === lastDay_(month)) list.push(month);
+  if (Number(today.slice(8)) <= 3) list.push(shiftMonth_(month, -1));
+  closes.forEach((c) => {
+    if (c.status === 'returned') list.push(c.month);
+  });
+  return list.filter((m, i) => list.indexOf(m) === i && isTracked_(m) && open(m)).sort();
+}
+
+// 記録を始めた月より前は締めの対象にしない
+function isTracked_(month) {
+  const first = readAll_('tx').map((t) => String(t.date).slice(0, 7)).sort()[0];
+  return !!first && month >= first;
+}
+
+// 保護者がまだ見ていない明細（取り消し済みと、承認で入るおこづかいは除く）
+function uncheckedCount_() {
+  return readAll_('tx').filter((t) => !Number(t.mark) && !t.voided && t.source !== 'allowance').length;
+}
+
+function childCalendar_() {
+  const id = getMeta_('notifyCalendarId');
+  return id ? CalendarApp.getCalendarById(String(id)) : null;
+}
+
+// 本人側の通知の時刻は、本人の端末で「おこづかい帳」カレンダーの通知を「予定の開始時」にして決める
+function childEvent_(cal, kind, title, start, desc) {
+  clearEvents_(cal, kind);
+  cal.createEvent(title, start, new Date(start.getTime() + 15 * 60 * 1000), { description: desc + '\n' + APP_URL }).setTag(EVENT_TAG, kind);
+}
+
+function parentEvent_(kind, title, start, desc) {
+  const cal = CalendarApp.getDefaultCalendar();
+  clearEvents_(cal, kind);
+  const ev = cal.createEvent('おこづかい帳：' + title, start, new Date(start.getTime() + 15 * 60 * 1000), { description: desc + '\n' + APP_URL });
+  ev.setTag(EVENT_TAG, kind);
+  ev.removeAllReminders();
+  ev.addPopupReminder(0);
+}
+
+// 今日の予定のうち、この種類のものを消す
+function clearEvents_(cal, kind) {
+  if (!cal) return;
+  cal.getEventsForDay(new Date()).forEach((ev) => {
+    if (ev.getTag(EVENT_TAG) === kind) ev.deleteEvent();
+  });
+}
+
+// 終わった予定を消す（本人のカレンダーと、保護者のカレンダーのうち作ったものだけ）
+function cleanupEvents_() {
+  const end = timeOf_(today_(), 0);
+  const start = new Date(end.getTime() - 60 * 24 * 60 * 60 * 1000);
+  [childCalendar_(), CalendarApp.getDefaultCalendar()].forEach((cal) => {
+    if (!cal) return;
+    cal.getEvents(start, end).forEach((ev) => {
+      if (ev.getTag(EVENT_TAG)) ev.deleteEvent();
+    });
+  });
+}
+
+function timeOf_(date, hour) {
+  return new Date(Number(date.slice(0, 4)), Number(date.slice(5, 7)) - 1, Number(date.slice(8, 10)), hour, 0);
+}
+
+function emails_(prop) {
+  return String(PropertiesService.getScriptProperties().getProperty(prop) || '').split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+// 通知に失敗しても、元の操作は通す
+function notifySafe_(fn) {
+  try {
+    fn();
+  } catch (err) {
+    console.warn('notify failed: ' + err.message);
+  }
 }
 
 // ---- 締めの期間 ----
