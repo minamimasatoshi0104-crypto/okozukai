@@ -130,6 +130,8 @@ function initGoogle() {
   google.accounts.id.initialize({
     client_id: CFG.clientId,
     auto_select: true,
+    // Android の Chrome ではポップアップがフィルタで真っ白になることがあるため、画面下に出る形（FedCM）でログインする
+    use_fedcm_for_button: true,
     callback: onGoogleLogin,
   });
   googleReady = true;
